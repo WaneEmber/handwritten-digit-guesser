@@ -52,43 +52,32 @@ st.caption(
 
 
 def preprocess_image(image):
-    """
-    Improved image preprocessing:
-    1. Grayscale conversion
-    2. Adaptive thresholding
-    3. Remove small noise components
-    4. Keep all digit strokes
-    5. Crop and center the digit
-    6. Resize to 8x8
-    7. Convert pixels to 0-16
-    """
 
-    # Correct orientation and convert to grayscale
+    # 1. Correct orientation and convert to grayscale
     image = ImageOps.exif_transpose(image).convert("L")
     gray = np.asarray(image, dtype=np.uint8)
 
     h, w = gray.shape
     min_side = min(h, w)
 
-    # Adaptive threshold block size
-    block = min(51, min_side - 1)
+    # 2. Adaptive thresholding
+    block_size = min(51, min_side - 1)
 
-    if block % 2 == 0:
-        block -= 1
+    if block_size % 2 == 0:
+        block_size -= 1
 
-    block = max(block, 3)
+    block_size = max(3, block_size)
 
-    # Detect pencil strokes
     binary = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        block,
-        5
+        block_size,
+        7
     )
 
-    # Remove tiny isolated noise without thickening strokes
+    # 3. Remove very small noise
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         binary,
         connectivity=8
@@ -96,24 +85,21 @@ def preprocess_image(image):
 
     cleaned = np.zeros_like(binary)
 
-    # Keep small disconnected stroke fragments too
-    min_area = 3
-
     for i in range(1, count):
+
         area = stats[i, cv2.CC_STAT_AREA]
 
-        if area >= min_area:
+        if area >= 4:
             cleaned[labels == i] = 255
 
-    # Find all remaining foreground pixels
+    # 4. Find overall digit boundaries
     ys, xs = np.where(cleaned > 0)
 
     if len(xs) == 0:
         raise ValueError(
-            "No digit detected. Please upload a clearer image."
+            "No handwriting detected. Try a clearer image."
         )
 
-    # Bounding box of all strokes, not just the largest component
     x_min = int(xs.min())
     x_max = int(xs.max())
     y_min = int(ys.min())
@@ -126,42 +112,63 @@ def preprocess_image(image):
 
     crop_h, crop_w = crop.shape
 
-    # Add padding so the digit doesn't touch the edge
-    padding = max(2, int(max(crop_h, crop_w) * 0.15))
+    # 5. Add padding and center
+    padding = max(2, int(max(crop_h, crop_w) * 0.18))
 
-    padded_h = crop_h + padding * 2
-    padded_w = crop_w + padding * 2
+    new_h = crop_h + 2 * padding
+    new_w = crop_w + 2 * padding
 
-    side = max(padded_h, padded_w)
+    side = max(new_h, new_w)
 
-    square = np.zeros((side, side), dtype=np.uint8)
+    square = np.zeros(
+        (side, side),
+        dtype=np.uint8
+    )
 
-    # Center the digit in a square canvas
-    offset_y = (side - padded_h) // 2
-    offset_x = (side - padded_w) // 2
+    start_y = (side - crop_h) // 2
+    start_x = (side - crop_w) // 2
 
     square[
-        offset_y + padding:
-        offset_y + padding + crop_h,
-        offset_x + padding:
-        offset_x + padding + crop_w
+        start_y:start_y + crop_h,
+        start_x:start_x + crop_w
     ] = crop
 
-    # Resize directly to 8x8
+    # 6. Resize to 8x8 using area interpolation
     small = cv2.resize(
         square,
         (8, 8),
         interpolation=cv2.INTER_AREA
     )
 
-    # Convert to the Digits dataset pixel scale: 0-16
-    pixel_data = small.astype(np.float32) / 255.0 * 16.0
+    # 7. Brightness normalization
+    # Important: prevent very faint strokes from becoming values 1-3
+    max_value = float(small.max())
 
-    model_input = pixel_data.reshape(1, 64)
+    if max_value > 0:
 
-    # Display enlarged processed image
+        normalized = (
+            small.astype(np.float32)
+            / max_value
+            * 16.0
+        )
+
+    else:
+
+        normalized = small.astype(np.float32)
+
+    # 8. Slight contrast adjustment
+    normalized = np.clip(
+        normalized,
+        0,
+        16
+    )
+
+    # Convert to model input
+    model_input = normalized.reshape(1, 64).astype(np.float32)
+
+    # Preview
     preview_array = np.rint(
-        pixel_data / 16.0 * 255
+        normalized / 16.0 * 255
     ).astype(np.uint8)
 
     preview = Image.fromarray(preview_array)
@@ -203,31 +210,35 @@ if uploaded is not None:
         ) = preprocess_image(original)
 
         st.subheader("Original Image")
-        st.image(original, use_container_width=True)
+
+        st.image(
+            original,
+            use_container_width=True
+        )
 
         st.caption(
-            f"Detected digit area: "
-            f"x={bbox[0]}, y={bbox[1]}, "
+            f"Detected area: x={bbox[0]}, y={bbox[1]}, "
             f"width={bbox[2]}, height={bbox[3]}"
         )
 
-        st.subheader("Detected Digit Strokes")
+        st.subheader("Detected Handwriting")
+
         st.image(
             crop_preview,
             use_container_width=True
         )
 
-        st.subheader("Shared Processed 8×8 Input")
+        st.subheader("Processed 8×8 Image")
 
         st.image(
             preview.resize(
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="Same exact pixels are used by KNN and SVM"
+            caption="Same exact pixels used by both models"
         )
 
-        # Both models receive the exact same input
+        # Both models use the exact same input
         knn_prediction = int(
             knn_model.predict(model_input)[0]
         )
@@ -288,11 +299,11 @@ if uploaded is not None:
         else:
 
             st.warning(
-                "Models disagree. "
-                "The uploaded image may be difficult to classify."
+                "Models disagree. Try a clearer, "
+                "more centered handwritten digit."
             )
 
-        st.subheader("Shared 8×8 Pixel Values (0–16)")
+        st.subheader("8×8 Pixel Values (0–16)")
 
         values = np.rint(
             model_input.reshape(8, 8)
@@ -306,9 +317,7 @@ if uploaded is not None:
 
         st.caption(
             "Confidence is an estimated probability, "
-            "not measured accuracy. "
-            "Real-photo performance can differ from "
-            "held-out dataset results."
+            "not measured accuracy."
         )
 
     except Exception as error:
