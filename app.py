@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 
 # ======================================
-# 页面设置
+# Page Configuration
 # ======================================
 
 st.set_page_config(
@@ -20,13 +20,13 @@ st.set_page_config(
 )
 
 st.title("✍️ Handwritten Digit Guesser")
-st.write("上传手写数字图片，使用 KNN 和 SVM 进行识别。")
+st.write("Upload a handwritten digit image and let the AI recognize it.")
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
 # ======================================
-# 加载模型
+# Load Models
 # ======================================
 
 @st.cache_resource
@@ -45,12 +45,12 @@ try:
     knn_model, svm_model = load_models()
 
 except Exception as e:
-    st.error(f"模型加载失败：{e}")
+    st.error(f"Model loading failed: {e}")
     st.stop()
 
 
 # ======================================
-# 生成清晰的 8×8 像素网格
+# Create 8×8 Pixel Grid Preview
 # ======================================
 
 def make_pixel_grid(matrix):
@@ -71,7 +71,10 @@ def make_pixel_grid(matrix):
         for col in range(8):
 
             value = float(matrix[row, col])
-            brightness = int(np.clip(value / 16, 0, 1) * 255)
+
+            brightness = int(
+                np.clip(value / 16, 0, 1) * 255
+            )
 
             x1 = margin + col * cell_size
             y1 = margin + row * cell_size
@@ -88,18 +91,22 @@ def make_pixel_grid(matrix):
 
 
 # ======================================
-# 图片预处理
+# Image Preprocessing
 # ======================================
 
 def preprocess_image(image):
 
-    # 1. 转换成灰度图
+    # 1. Convert image to grayscale
     rgb = np.array(image.convert("RGB"))
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    gray = cv2.cvtColor(
+        rgb,
+        cv2.COLOR_RGB2GRAY
+    )
 
     height, width = gray.shape
 
-    # 2. 估算图片背景亮度
+    # 2. Estimate background brightness
     border = np.concatenate([
         gray[0, :],
         gray[-1, :],
@@ -109,20 +116,20 @@ def preprocess_image(image):
 
     background_value = float(np.median(border))
 
-    # 3. 平滑图片，用于检测数字边界
+    # 3. Blur the image slightly
     blurred = cv2.GaussianBlur(
         gray,
         (5, 5),
         0
     )
 
-    # 4. 根据背景选择二值化方向
+    # 4. Select threshold direction
     if background_value >= 127:
         threshold_type = cv2.THRESH_BINARY_INV
     else:
         threshold_type = cv2.THRESH_BINARY
 
-    # 5. 自适应阈值只用于检测数字位置
+    # 5. Adaptive thresholding
     block_size = min(51, min(height, width))
 
     if block_size % 2 == 0:
@@ -139,14 +146,14 @@ def preprocess_image(image):
         8
     )
 
-    # 6. 连通区域检测
+    # 6. Detect connected components
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         binary,
         connectivity=8
     )
 
     if count <= 1:
-        raise ValueError("没有检测到手写数字。")
+        raise ValueError("No handwritten digit was detected.")
 
     candidates = []
 
@@ -158,7 +165,7 @@ def preprocess_image(image):
         h = stats[i, cv2.CC_STAT_HEIGHT]
         area = stats[i, cv2.CC_STAT_AREA]
 
-        # 排除与图片边缘相连的区域
+        # Ignore components touching image borders
         touches_edge = (
             x == 0 or
             y == 0 or
@@ -179,10 +186,10 @@ def preprocess_image(image):
 
     if not candidates:
         raise ValueError(
-            "没有找到数字主体，请检查图片背景和边缘。"
+            "No valid digit region was found. Please check the image."
         )
 
-    # 7. 找到面积最大的主体区域
+    # 7. Find the largest component
     largest = max(
         candidates,
         key=lambda item: item["area"]
@@ -195,7 +202,7 @@ def preprocess_image(image):
     lw = largest["w"]
     lh = largest["h"]
 
-    # 8. 保留主体附近的笔画
+    # 8. Keep components near the main digit
     nearby_padding = max(
         15,
         int(max(lw, lh) * 0.25)
@@ -239,23 +246,24 @@ def preprocess_image(image):
             kept_components += 1
 
     if np.count_nonzero(clean) == 0:
-        raise ValueError("没有找到有效的数字笔画。")
+        raise ValueError("No valid digit strokes were found.")
 
-    # 9. 获取数字边界
+    # 9. Find digit boundaries
     points = cv2.findNonZero(clean)
 
     x, y, box_width, box_height = cv2.boundingRect(points)
 
-    # 防止整张背景被误当成数字
+    # Prevent the entire background from being treated as a digit
     if (
         box_width > width * 0.85 or
         box_height > height * 0.85
     ):
         raise ValueError(
-            "检测区域仍然包含大面积背景，请更换图片。"
+            "The detected region includes too much background. "
+            "Please use an image with a cleaner background."
         )
 
-    # 10. 增加少量边缘
+    # 10. Add a small margin
     padding = max(
         3,
         int(max(box_width, box_height) * 0.08)
@@ -271,10 +279,10 @@ def preprocess_image(image):
     crop_height, crop_width = crop_mask.shape
 
     # ==================================
-    # 关键修改：保留原始灰度笔画
+    # Preserve Original Grayscale Strokes
     # ==================================
 
-    # 11. 估算局部背景，减少照片背景不均匀的影响
+    # 11. Estimate local background
     sigma = max(
         5,
         min(height, width) * 0.025
@@ -305,7 +313,7 @@ def preprocess_image(image):
         255
     )
 
-    # 12. 只保留检测到的笔画区域，但保留灰度深浅
+    # 12. Keep grayscale stroke information
     crop_gray = ink_strength[y1:y2, x1:x2]
 
     crop_gray = cv2.bitwise_and(
@@ -320,18 +328,18 @@ def preprocess_image(image):
         255
     ).astype(np.float32)
 
-    # 13. 对笔画强度进行归一化
+    # 13. Normalize stroke intensity
     positive_pixels = crop_gray[crop_gray > 0]
 
     if len(positive_pixels) == 0:
-        raise ValueError("没有提取到有效的灰度笔画。")
+        raise ValueError("No valid grayscale strokes were extracted.")
 
     intensity_reference = float(
         np.percentile(positive_pixels, 95)
     )
 
     if intensity_reference < 1:
-        raise ValueError("笔画亮度不足，无法生成模型输入。")
+        raise ValueError("Stroke brightness is too low.")
 
     crop_gray = (
         crop_gray / intensity_reference * 255.0
@@ -344,10 +352,10 @@ def preprocess_image(image):
     ).astype(np.uint8)
 
     # ==================================
-    # 缩放到 8×8
+    # Resize to 8×8
     # ==================================
 
-    # 14. 保持宽高比例，缩放到最大 7×7
+    # 14. Maintain aspect ratio and fit within 7×7
     target_size = 7
 
     scale = target_size / max(
@@ -371,7 +379,7 @@ def preprocess_image(image):
         interpolation=cv2.INTER_AREA
     )
 
-    # 15. 放到 8×8 画布中央
+    # 15. Place digit in the center of an 8×8 canvas
     small = np.zeros(
         (8, 8),
         dtype=np.uint8
@@ -385,7 +393,7 @@ def preprocess_image(image):
         start_x:start_x + new_width
     ] = resized
 
-    # 16. 转为 sklearn Digits 所使用的 0–16 范围
+    # 16. Convert pixel values to the 0–16 range
     processed = (
         small.astype(np.float32) / 255.0 * 16.0
     )
@@ -399,7 +407,7 @@ def preprocess_image(image):
     model_input = processed.reshape(1, 64)
 
     # ==================================
-    # 预览图片
+    # Generate Previews
     # ==================================
 
     binary_preview = Image.fromarray(clean)
@@ -425,19 +433,19 @@ def preprocess_image(image):
     grid_preview = make_pixel_grid(processed)
 
     # ==================================
-    # 调试信息
+    # Debug Information
     # ==================================
 
     debug = {
-        "原始图片尺寸": f"{width} × {height}",
-        "背景亮度": round(background_value, 2),
-        "数字边界尺寸": f"{box_width} × {box_height}",
-        "实际裁剪尺寸": f"{crop_width} × {crop_height}",
-        "缩放后尺寸": f"{new_width} × {new_height}",
-        "保留的连通区域数量": kept_components,
-        "灰度笔画参考亮度": round(intensity_reference, 2),
-        "8×8 非零像素格数": int(np.count_nonzero(processed)),
-        "8×8 最大像素值": round(float(processed.max()), 2)
+        "Original image size": f"{width} × {height}",
+        "Background brightness": round(background_value, 2),
+        "Digit bounding box": f"{box_width} × {box_height}",
+        "Cropped image size": f"{crop_width} × {crop_height}",
+        "Resized digit size": f"{new_width} × {new_height}",
+        "Retained connected components": kept_components,
+        "Stroke intensity reference": round(intensity_reference, 2),
+        "Non-zero 8×8 pixels": int(np.count_nonzero(processed)),
+        "Maximum 8×8 pixel value": round(float(processed.max()), 2)
     }
 
     return (
@@ -453,7 +461,7 @@ def preprocess_image(image):
 
 
 # ======================================
-# 模型预测
+# Prediction
 # ======================================
 
 def predict_digit(model, model_input):
@@ -474,11 +482,11 @@ def predict_digit(model, model_input):
 
 
 # ======================================
-# 页面主体
+# Main Application
 # ======================================
 
 uploaded_file = st.file_uploader(
-    "上传手写数字图片",
+    "Upload a handwritten digit image",
     type=["png", "jpg", "jpeg", "bmp"]
 )
 
@@ -488,7 +496,7 @@ if uploaded_file is not None:
 
         image = Image.open(uploaded_file).convert("RGB")
 
-        st.subheader("原始图片")
+        st.subheader("Original Image")
         st.image(image, width=300)
 
         (
@@ -502,25 +510,28 @@ if uploaded_file is not None:
             debug
         ) = preprocess_image(image)
 
-        # 预处理结果
+        # ==================================
+        # Preprocessing Results
+        # ==================================
+
         st.divider()
-        st.subheader("图片预处理结果")
+        st.subheader("Image Preprocessing")
 
         col1, col2 = st.columns(2)
 
         with col1:
 
-            st.markdown("**Binary Image（边界检测）**")
+            st.markdown("**Binary Image (Digit Detection)**")
             st.image(binary_preview, width=300)
 
         with col2:
 
-            st.markdown("**Detected Handwriting（灰度笔画）**")
+            st.markdown("**Detected Handwriting (Grayscale)**")
             st.image(crop_preview, width=300)
 
         st.divider()
 
-        st.markdown("### Resized Digit（8×8 放大预览）")
+        st.markdown("### Resized Digit (8×8 Enlarged Preview)")
         st.image(resized_preview, width=400)
 
         st.markdown("### Processed 8×8 Image")
@@ -529,7 +540,10 @@ if uploaded_file is not None:
         st.markdown("### 8×8 Pixel Grid")
         st.image(grid_preview, width=460)
 
-        # 矩阵
+        # ==================================
+        # Pixel Matrix
+        # ==================================
+
         st.subheader("8×8 Pixel Matrix")
 
         st.dataframe(
@@ -537,15 +551,22 @@ if uploaded_file is not None:
             use_container_width=True
         )
 
-        # 调试信息
-        with st.expander("预处理调试信息", expanded=True):
+        # ==================================
+        # Debug Information
+        # ==================================
+
+        with st.expander("Preprocessing Debug Information"):
 
             for key, value in debug.items():
-                st.write(f"**{key}：** {value}")
 
-        # 模型预测
+                st.write(f"**{key}:** {value}")
+
+        # ==================================
+        # Recognition Results
+        # ==================================
+
         st.divider()
-        st.subheader("识别结果")
+        st.subheader("Recognition Results")
 
         col1, col2 = st.columns(2)
 
@@ -561,14 +582,14 @@ if uploaded_file is not None:
                 )
 
                 st.metric(
-                    "预测数字",
+                    "Predicted Digit",
                     str(prediction)
                 )
 
                 if confidence is not None:
 
                     st.metric(
-                        "模型置信度",
+                        "Prediction Confidence",
                         f"{confidence:.2f}%"
                     )
 
@@ -584,35 +605,35 @@ if uploaded_file is not None:
                 )
 
                 st.metric(
-                    "预测数字",
+                    "Predicted Digit",
                     str(prediction)
                 )
 
                 if confidence is not None:
 
                     st.metric(
-                        "模型置信度",
+                        "Prediction Confidence",
                         f"{confidence:.2f}%"
                     )
 
     except Exception as e:
 
-        st.error(f"图片处理失败：{e}")
+        st.error(f"Image processing failed: {e}")
 
 else:
 
-    st.info("请先上传一张手写数字图片。")
+    st.info("Please upload a handwritten digit image to get started.")
 
 
 # ======================================
-# 模型评估信息
+# Model Evaluation Information
 # ======================================
 
 metrics_path = BASE_DIR / "metrics.json"
 
 if metrics_path.exists():
 
-    with st.expander("模型训练评估信息"):
+    with st.expander("Model Evaluation Metrics"):
 
         try:
 
@@ -626,4 +647,4 @@ if metrics_path.exists():
 
         except Exception as e:
 
-            st.warning(f"无法读取 metrics.json：{e}")
+            st.warning(f"Could not load metrics.json: {e}")
