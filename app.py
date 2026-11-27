@@ -1,303 +1,120 @@
 import streamlit as st
-import joblib
+import joblib, json
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter
+import cv2
+from PIL import Image, ImageOps
 
-# =========================
-# Page configuration
-# =========================
-st.set_page_config(
-    page_title="AI Handwritten Digit Guesser",
-    page_icon="🔢",
-    layout="centered"
-)
-
+st.set_page_config(page_title="AI Handwritten Digit Guesser", page_icon="🔢", layout="centered")
 st.title("🔢 AI Handwritten Digit Guesser")
-st.write(
-    "Upload a handwritten digit image and let two machine learning "
-    "models predict the digit."
-)
+st.write("Compare KNN and SVM predictions for a handwritten digit.")
 
-# =========================
-# Load trained models
-# =========================
 @st.cache_resource
 def load_models():
-    knn = joblib.load("knn_model.joblib")
-    logistic = joblib.load("logistic_model.joblib")
-    return knn, logistic
+    return joblib.load("knn_model.joblib"), joblib.load("svm_model.joblib")
 
-knn_model, logistic_model = load_models()
+@st.cache_data
+def load_metrics():
+    with open("metrics.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# =========================
-# Image preprocessing
-# =========================
+knn_model, svm_model = load_models()
+metrics = load_metrics()
+
+st.subheader("Model Test-Set Performance")
+m1, m2 = st.columns(2)
+m1.metric("KNN Accuracy", f"{metrics['results']['knn']['accuracy']*100:.2f}%")
+m2.metric("SVM Accuracy", f"{metrics['results']['svm']['accuracy']*100:.2f}%")
+st.caption("Held-out dataset scores; uploaded-photo performance may differ.")
+
 def preprocess_image(image):
-    # Correct image orientation
-    image = ImageOps.exif_transpose(image)
+    image = ImageOps.exif_transpose(image).convert("L")
+    arr = np.asarray(image, dtype=np.uint8)
+    sigma = max(4, min(image.size) / 30)
+    background = cv2.GaussianBlur(arr, (0, 0), sigmaX=sigma)
+    difference = cv2.subtract(background, arr)
+    positive = difference[difference > 0]
+    if positive.size == 0:
+        raise ValueError("No dark strokes detected. Try a clearer photo.")
 
-    # Convert to grayscale
-    image = ImageOps.grayscale(image)
+    threshold = max(5, int(np.percentile(positive, 75)))
+    binary = (difference > threshold).astype(np.uint8)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+    H, W = binary.shape
+    candidates = []
+    for component_id, stat in enumerate(stats[1:], start=1):
+        x, y, w, h, area = [int(v) for v in stat]
+        if area >= 30 and x > 0 and y > 0 and x+w < W and y+h < H:
+            candidates.append((component_id, x, y, w, h, area))
 
-    # Remove uneven background using Gaussian blur
-    background_image = image.filter(
-        ImageFilter.GaussianBlur(radius=30)
-    )
+    if candidates:
+        component_id, x, y, w, h, _ = max(candidates, key=lambda item: item[5])
+        component = labels[y:y+h, x:x+w] == component_id
+        crop = np.where(component, difference[y:y+h, x:x+w], 0).astype(np.uint8)
+    else:
+        ys, xs = np.where(binary > 0)
+        if len(xs) == 0:
+            raise ValueError("Could not isolate digit. Try cropping closer.")
+        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        crop = np.where(binary[y0:y1+1, x0:x1+1], difference[y0:y1+1, x0:x1+1], 0).astype(np.uint8)
 
-    background = np.array(
-        background_image,
-        dtype=np.float32
-    )
+    if crop.max() == 0:
+        raise ValueError("Detected region is too faint. Try a clearer photo.")
+    crop = (crop.astype(np.float32) / float(crop.max()) * 255).astype(np.uint8)
 
-    original = np.array(
-        image,
-        dtype=np.float32
-    )
+    ch, cw = crop.shape
+    side = max(ch, cw)
+    square = Image.new("L", (side, side), 0)
+    square.paste(Image.fromarray(crop), ((side-cw)//2, (side-ch)//2))
+    square.thumbnail((6, 6), Image.Resampling.LANCZOS)
+    base_canvas = Image.new("L", (8, 8), 0)
+    base_canvas.paste(square, ((8-square.width)//2, (8-square.height)//2))
 
-    # Extract dark pencil/ink strokes
-    difference = np.clip(
-        background - original,
-        0,
-        255
-    )
+    # Keep softer contrast for KNN; normalize resized intensity for SVM.
+    knn_canvas = base_canvas.copy()
+    knn_data = np.asarray(knn_canvas, dtype=np.float32).reshape(1, 64) / 255.0 * 16.0
+    base = np.asarray(base_canvas, dtype=np.float32)
+    svm_canvas = Image.fromarray(np.clip(base / max(float(base.max()), 1) * 255, 0, 255).astype(np.uint8))
+    svm_data = np.asarray(svm_canvas, dtype=np.float32).reshape(1, 64) / 255.0 * 16.0
+    return knn_data, svm_data, knn_canvas, svm_canvas
 
-    max_value = difference.max()
-
-    if max_value < 15:
-        raise ValueError(
-            "No clear digit detected. Please upload a clearer image."
-        )
-
-    # Enhance stroke contrast
-    enhanced = (
-        difference / max_value * 255
-    ).astype(np.uint8)
-
-    # Create a mask to remove weak background noise
-    threshold = max(
-        25,
-        int(enhanced.max() * 0.25)
-    )
-
-    mask = enhanced > threshold
-
-    ys, xs = np.where(mask)
-
-    if len(xs) == 0:
-        raise ValueError(
-            "No clear digit detected. Please try another image."
-        )
-
-    # Crop around the digit
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-
-    cropped = enhanced[
-        y_min:y_max + 1,
-        x_min:x_max + 1
-    ]
-
-    # Keep only the detected digit area
-    cropped_mask = mask[
-        y_min:y_max + 1,
-        x_min:x_max + 1
-    ]
-
-    cropped = np.where(
-        cropped_mask,
-        cropped,
-        0
-    ).astype(np.uint8)
-
-    digit = Image.fromarray(cropped)
-
-    # Resize digit to fit inside a 6x6 area
-    digit.thumbnail(
-        (6, 6),
-        Image.Resampling.LANCZOS
-    )
-
-    # Place digit in the center of an 8x8 canvas
-    canvas = Image.new(
-        "L",
-        (8, 8),
-        0
-    )
-
-    x_offset = (8 - digit.width) // 2
-    y_offset = (8 - digit.height) // 2
-
-    canvas.paste(
-        digit,
-        (x_offset, y_offset)
-    )
-
-    # Convert pixel values to sklearn Digits scale (0-16)
-    processed = (
-        np.array(canvas, dtype=np.float64)
-        / 255.0
-        * 16.0
-    )
-
-    processed = processed.reshape(1, 64)
-
-    return processed, canvas
-
-
-# =========================
-# Upload image
-# =========================
-uploaded_file = st.file_uploader(
-    "Upload a handwritten digit image",
-    type=["png", "jpg", "jpeg"]
-)
-
-# =========================
-# Prediction
-# =========================
-if uploaded_file is not None:
-
+uploaded = st.file_uploader("Upload a digit photo (PNG/JPG/JPEG)", type=["png", "jpg", "jpeg"])
+if uploaded:
     try:
-        image = Image.open(uploaded_file)
+        original = Image.open(uploaded)
+        knn_input, svm_input, knn_canvas, svm_canvas = preprocess_image(original)
+        st.subheader("Uploaded Photo")
+        st.image(original, caption="Original image", use_container_width=True)
+        st.subheader("Processed Model Inputs")
+        c1, c2 = st.columns(2)
+        c1.image(knn_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="KNN input")
+        c2.image(svm_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="SVM input")
 
-        processed_data, processed_image = preprocess_image(image)
-
-        # Display uploaded and processed images
-        st.subheader("Uploaded Image")
-
-        st.image(
-            image,
-            caption="Original uploaded image",
-            use_container_width=True
-        )
-
-        st.subheader("Processed 8×8 Image")
-
-        st.image(
-            processed_image.resize(
-                (320, 320),
-                Image.Resampling.NEAREST
-            ),
-            caption="8×8 grayscale image used by the models",
-            use_container_width=False
-        )
-
-        # =========================
-        # Model predictions
-        # =========================
-        knn_prediction = knn_model.predict(
-            processed_data
-        )[0]
-
-        logistic_prediction = logistic_model.predict(
-            processed_data
-        )[0]
-
-        # Probability scores
-        knn_probabilities = knn_model.predict_proba(
-            processed_data
-        )[0]
-
-        logistic_probabilities = logistic_model.predict_proba(
-            processed_data
-        )[0]
-
-        knn_classes = knn_model.classes_
-        logistic_classes = logistic_model.classes_
-
-        knn_confidence = (
-            knn_probabilities[
-                np.where(knn_classes == knn_prediction)[0][0]
-            ] * 100
-        )
-
-        logistic_confidence = (
-            logistic_probabilities[
-                np.where(logistic_classes == logistic_prediction)[0][0]
-            ] * 100
-        )
-
-        # =========================
-        # Display results
-        # =========================
-        st.subheader("Prediction Results")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.metric(
-                "KNN Prediction",
-                str(knn_prediction)
-            )
-
-            st.write(
-                f"Model confidence: {knn_confidence:.2f}%"
-            )
-
-        with col2:
-            st.metric(
-                "Logistic Regression Prediction",
-                str(logistic_prediction)
-            )
-
-            st.write(
-                f"Model confidence: {logistic_confidence:.2f}%"
-            )
-
-        # =========================
-        # Agreement result
-        # =========================
-        if knn_prediction == logistic_prediction:
-
-            st.success(
-                f"Both models agree! The predicted digit is "
-                f"{knn_prediction}."
-            )
-
+        kp = int(knn_model.predict(knn_input)[0])
+        sp = int(svm_model.predict(svm_input)[0])
+        kprob = knn_model.predict_proba(knn_input)[0]
+        sprob = svm_model.predict_proba(svm_input)[0]
+        kconf = float(kprob[np.where(knn_model.classes_ == kp)[0][0]]) * 100
+        sconf = float(sprob[np.where(svm_model.classes_ == sp)[0][0]]) * 100
+        st.subheader("Predictions")
+        c1, c2 = st.columns(2)
+        c1.metric("KNN Prediction", kp)
+        c1.write(f"Estimated model confidence: {kconf:.2f}%")
+        c2.metric("SVM Prediction", sp)
+        c2.write(f"Estimated model confidence: {sconf:.2f}%")
+        if kp == sp:
+            st.success(f"Both models agree: {kp}")
         else:
+            st.warning("Models disagree. Try a closer crop with the digit centered and clear.")
 
-            st.warning(
-                "The two models disagree. "
-                "Their predictions may be affected by the handwriting "
-                "style or image quality."
-            )
+        st.subheader("8×8 Pixel Values (0–16)")
+        t1, t2 = st.columns(2)
+        t1.write("KNN input")
+        t1.dataframe(np.rint(np.asarray(knn_canvas, dtype=float)/255*16).astype(int), hide_index=True)
+        t2.write("SVM input")
+        t2.dataframe(np.rint(np.asarray(svm_canvas, dtype=float)/255*16).astype(int), hide_index=True)
+        st.caption("Confidence is the model-estimated probability, not measured accuracy. Photo inputs may differ from the training dataset.")
+    except Exception as err:
+        st.error(f"Image processing failed: {err}")
 
-        # =========================
-        # Display pixel values
-        # =========================
-        st.subheader("8×8 Pixel Values")
-
-        pixel_values = np.round(
-            np.array(processed_image) / 255.0 * 16
-        ).astype(int)
-
-        st.dataframe(
-            pixel_values,
-            hide_index=True,
-            use_container_width=True
-        )
-
-        # =========================
-        # Probability disclaimer
-        # =========================
-        st.caption(
-            "Note: Model confidence represents the probability score "
-            "estimated by the model. It is not a guarantee of prediction "
-            "accuracy."
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Error processing image: {e}"
-        )
-
-# =========================
-# Footer
-# =========================
 st.markdown("---")
-
-st.caption(
-    "AI Handwritten Digit Guesser | "
-    "Machine Learning Course Project"
-)
+st.caption("Course project: handwritten digit classification using KNN and SVM.")
