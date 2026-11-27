@@ -81,12 +81,12 @@ st.caption(
 
 
 # ==========================================
-# 4. IMPROVED IMAGE PREPROCESSING
+# 4. Improved image preprocessing
 # ==========================================
 
 def preprocess_image(image):
 
-    # 1. Correct orientation and grayscale
+    # 1. Correct orientation and convert to grayscale
     image = ImageOps.exif_transpose(image).convert("L")
 
     gray = np.asarray(image, dtype=np.uint8)
@@ -96,14 +96,14 @@ def preprocess_image(image):
     if min(h, w) < 3:
         raise ValueError("Image is too small.")
 
-    # 2. Gaussian Blur
+    # 2. Gaussian blur
     blurred = cv2.GaussianBlur(
         gray,
         (3, 3),
         0
     )
 
-    # 3. Adaptive Threshold
+    # 3. Adaptive threshold
     min_side = min(h, w)
 
     block_size = min(
@@ -122,7 +122,7 @@ def preprocess_image(image):
         7
     )
 
-    # 4. Connected Components
+    # 4. Remove very small noise, but keep all meaningful components
     count, labels, stats, centroids = (
         cv2.connectedComponentsWithStats(
             binary,
@@ -130,7 +130,6 @@ def preprocess_image(image):
         )
     )
 
-    # Keep all meaningful components instead of only the largest
     foreground = np.zeros_like(binary)
 
     min_area = max(
@@ -143,14 +142,12 @@ def preprocess_image(image):
         area = int(stats[i, cv2.CC_STAT_AREA])
 
         if area >= min_area:
-
             foreground[labels == i] = 255
 
-    # 5. Find the bounding box of all retained handwriting
+    # 5. Find the bounding box of all handwriting
     ys, xs = np.where(foreground > 0)
 
     if len(xs) == 0:
-
         raise ValueError(
             "Could not detect handwriting. "
             "Please try another image."
@@ -165,25 +162,16 @@ def preprocess_image(image):
     cw = x_max - x_min + 1
     ch = y_max - y_min + 1
 
-    # 6. Crop handwriting
+    # 6. Crop all handwriting
     crop = foreground[
         y_min:y_max + 1,
         x_min:x_max + 1
     ]
 
-    # 7. Slightly thicken thin handwriting
-    kernel = np.ones((3, 3), np.uint8)
-
-    crop = cv2.dilate(
-        crop,
-        kernel,
-        iterations=1
-    )
-
-    # 8. Create square canvas with padding
+    # 7. Make a square canvas
     padding = max(
         2,
-        int(max(cw, ch) * 0.12)
+        int(max(cw, ch) * 0.15)
     )
 
     side = max(cw, ch) + padding * 2
@@ -193,24 +181,54 @@ def preprocess_image(image):
         dtype=np.uint8
     )
 
-    start_x = (side - crop.shape[1]) // 2
-    start_y = (side - crop.shape[0]) // 2
+    start_x = (side - cw) // 2
+    start_y = (side - ch) // 2
 
     square[
-        start_y:start_y + crop.shape[0],
-        start_x:start_x + crop.shape[1]
+        start_y:start_y + ch,
+        start_x:start_x + cw
     ] = crop
 
-    # 9. Resize directly to 8x8
-    small = cv2.resize(
+    # 8. First resize to 24x24
+    medium = cv2.resize(
         square,
+        (24, 24),
+        interpolation=cv2.INTER_AREA
+    )
+
+    # 9. Strengthen thin strokes at this intermediate size
+    kernel = np.ones(
+        (3, 3),
+        dtype=np.uint8
+    )
+
+    medium = cv2.dilate(
+        medium,
+        kernel,
+        iterations=1
+    )
+
+    # 10. Resize from 24x24 to 8x8
+    small = cv2.resize(
+        medium,
         (8, 8),
         interpolation=cv2.INTER_AREA
     )
 
-    # 10. Convert pixels to 0-16
+    # 11. Contrast normalization
+    small_float = small.astype(np.float32)
+
+    max_value = float(small_float.max())
+
+    if max_value <= 0:
+        raise ValueError(
+            "The handwriting disappeared during resizing. "
+            "Please use a clearer image."
+        )
+
+    # Map the brightest pixel to 16
     final_image = (
-        small.astype(np.float32) / 255.0 * 16.0
+        small_float / max_value * 16.0
     )
 
     final_image = np.clip(
@@ -219,13 +237,13 @@ def preprocess_image(image):
         16
     )
 
-    # 11. Model input
+    # 12. Model input
     model_input = final_image.reshape(
         1,
         64
     ).astype(np.float32)
 
-    # 12. Preview
+    # 13. Preview
     preview_array = np.rint(
         final_image / 16.0 * 255
     ).astype(np.uint8)
@@ -280,6 +298,7 @@ if uploaded is not None:
             bbox
         ) = preprocess_image(original)
 
+        # Original image
         st.subheader("Original Image")
 
         st.image(
@@ -293,6 +312,7 @@ if uploaded is not None:
             f"width={bbox[2]}, height={bbox[3]}"
         )
 
+        # Binary image
         st.subheader("Binary Image")
 
         st.image(
@@ -300,6 +320,7 @@ if uploaded is not None:
             use_container_width=True
         )
 
+        # Cropped handwriting
         st.subheader("Detected Handwriting")
 
         st.image(
@@ -307,6 +328,7 @@ if uploaded is not None:
             use_container_width=True
         )
 
+        # Processed image
         st.subheader("Processed 8×8 Image")
 
         st.image(
@@ -314,7 +336,7 @@ if uploaded is not None:
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="Directly resized to 8×8"
+            caption="24×24 intermediate image converted to 8×8"
         )
 
         # ==================================
@@ -399,7 +421,7 @@ if uploaded is not None:
             )
 
         # ==================================
-        # 10. Display 8x8 pixel values
+        # 10. Display pixel values
         # ==================================
 
         st.subheader("8×8 Pixel Values (0–16)")
