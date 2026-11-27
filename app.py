@@ -32,7 +32,7 @@ knn_model, logistic_model = load_models()
 # =========================
 def preprocess_image(image):
 
-    # 1. Correct image orientation
+    # 1. Correct orientation
     image = ImageOps.exif_transpose(image)
 
     # 2. Convert to grayscale
@@ -104,7 +104,7 @@ def preprocess_image(image):
         x_min:x_max + 1
     ]
 
-    # Remove pixels outside the detected digit
+    # Remove background pixels
     digit_array = np.where(
         digit_mask,
         digit_array,
@@ -134,14 +134,43 @@ def preprocess_image(image):
         (x_offset, y_offset)
     )
 
-    # 11. Convert pixels to sklearn digits range 0-16
+    # 11. Normalize brightness after resizing
+    canvas_array = np.array(
+        canvas,
+        dtype=np.float32
+    )
+
+    nonzero_pixels = canvas_array[
+        canvas_array > 0
+    ]
+
+    if len(nonzero_pixels) > 0:
+
+        reference = float(
+            np.percentile(nonzero_pixels, 95)
+        )
+
+        if reference > 0:
+
+            canvas_array = np.clip(
+                canvas_array / reference * 255,
+                0,
+                255
+            )
+
+    # 12. Convert to sklearn digits range (0-16)
     processed = (
-        np.array(canvas, dtype=np.float64)
+        canvas_array.astype(np.float64)
         / 255.0
         * 16.0
     )
 
-    return processed.reshape(1, 64), canvas
+    # 13. Create display image
+    display_image = Image.fromarray(
+        canvas_array.astype(np.uint8)
+    )
+
+    return processed.reshape(1, 64), display_image
 
 
 # =========================
@@ -166,7 +195,7 @@ uploaded_file = st.file_uploader(
 
 
 # =========================
-# Image upload and display
+# Image upload
 # =========================
 if uploaded_file is not None:
 
@@ -226,7 +255,7 @@ if uploaded_file is not None:
             )
 
             # =========================
-            # Display results
+            # Display recognition results
             # =========================
             st.divider()
 
@@ -270,7 +299,7 @@ if uploaded_file is not None:
 
             st.image(
                 enlarged_image,
-                caption="Processed grayscale image",
+                caption="Normalized 8 × 8 grayscale image",
                 width=240
             )
 
