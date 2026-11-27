@@ -42,12 +42,7 @@ def load_models():
 @st.cache_data
 def load_metrics():
 
-    with open(
-        "metrics.json",
-        "r",
-        encoding="utf-8"
-    ) as f:
-
+    with open("metrics.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -86,7 +81,7 @@ st.caption(
 
 
 # ==========================================
-# 4. OLD-STYLE IMAGE PREPROCESSING
+# 4. IMPROVED IMAGE PREPROCESSING
 # ==========================================
 
 def preprocess_image(image):
@@ -94,10 +89,7 @@ def preprocess_image(image):
     # 1. Correct orientation and grayscale
     image = ImageOps.exif_transpose(image).convert("L")
 
-    gray = np.asarray(
-        image,
-        dtype=np.uint8
-    )
+    gray = np.asarray(image, dtype=np.uint8)
 
     h, w = gray.shape
 
@@ -116,8 +108,7 @@ def preprocess_image(image):
 
     block_size = min(
         51,
-        min_side if min_side % 2 == 1
-        else min_side - 1
+        min_side if min_side % 2 == 1 else min_side - 1
     )
 
     block_size = max(3, block_size)
@@ -139,66 +130,60 @@ def preprocess_image(image):
         )
     )
 
-    components = []
+    # Keep all meaningful components instead of only the largest
+    foreground = np.zeros_like(binary)
+
+    min_area = max(
+        8,
+        int(h * w * 0.00003)
+    )
 
     for i in range(1, count):
 
-        x = int(stats[i, cv2.CC_STAT_LEFT])
-        y = int(stats[i, cv2.CC_STAT_TOP])
-
-        cw = int(stats[i, cv2.CC_STAT_WIDTH])
-        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-
         area = int(stats[i, cv2.CC_STAT_AREA])
 
-        # Ignore very small noise
-        if area < max(8, int(h * w * 0.00003)):
-            continue
+        if area >= min_area:
 
-        # Ignore components touching image borders
-        if (
-            x <= 1
-            or y <= 1
-            or x + cw >= w - 1
-            or y + ch >= h - 1
-        ):
-            continue
+            foreground[labels == i] = 255
 
-        components.append(
-            (area, i, x, y, cw, ch)
-        )
+    # 5. Find the bounding box of all retained handwriting
+    ys, xs = np.where(foreground > 0)
 
-    if not components:
+    if len(xs) == 0:
 
         raise ValueError(
             "Could not detect handwriting. "
             "Please try another image."
         )
 
-    # 5. Select largest connected component
-    components.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
+    x_min = int(xs.min())
+    x_max = int(xs.max())
 
-    largest = components[0]
+    y_min = int(ys.min())
+    y_max = int(ys.max())
 
-    _, main_label, x, y, cw, ch = largest
-
-    main_mask = (
-        labels == main_label
-    ).astype(np.uint8) * 255
+    cw = x_max - x_min + 1
+    ch = y_max - y_min + 1
 
     # 6. Crop handwriting
-    crop = main_mask[
-        y:y + ch,
-        x:x + cw
+    crop = foreground[
+        y_min:y_max + 1,
+        x_min:x_max + 1
     ]
 
-    # 7. Make a square image with padding
+    # 7. Slightly thicken thin handwriting
+    kernel = np.ones((3, 3), np.uint8)
+
+    crop = cv2.dilate(
+        crop,
+        kernel,
+        iterations=1
+    )
+
+    # 8. Create square canvas with padding
     padding = max(
         2,
-        int(max(cw, ch) * 0.18)
+        int(max(cw, ch) * 0.12)
     )
 
     side = max(cw, ch) + padding * 2
@@ -208,28 +193,23 @@ def preprocess_image(image):
         dtype=np.uint8
     )
 
-    start_x = (side - cw) // 2
-    start_y = (side - ch) // 2
+    start_x = (side - crop.shape[1]) // 2
+    start_y = (side - crop.shape[0]) // 2
 
     square[
-        start_y:start_y + ch,
-        start_x:start_x + cw
+        start_y:start_y + crop.shape[0],
+        start_x:start_x + crop.shape[1]
     ] = crop
 
-    # 8. Resize to 6x6
+    # 9. Resize directly to 8x8
     small = cv2.resize(
         square,
-        (6, 6),
+        (8, 8),
         interpolation=cv2.INTER_AREA
     )
 
-    # 9. Put 6x6 image in the center of 8x8
-    final_image = np.zeros(
-        (8, 8),
-        dtype=np.float32
-    )
-
-    final_image[1:7, 1:7] = (
+    # 10. Convert pixels to 0-16
+    final_image = (
         small.astype(np.float32) / 255.0 * 16.0
     )
 
@@ -239,32 +219,26 @@ def preprocess_image(image):
         16
     )
 
-    # 10. Model input
+    # 11. Model input
     model_input = final_image.reshape(
         1,
         64
     ).astype(np.float32)
 
-    # 11. Preview
+    # 12. Preview
     preview_array = np.rint(
         final_image / 16.0 * 255
     ).astype(np.uint8)
 
-    preview = Image.fromarray(
-        preview_array
-    )
+    preview = Image.fromarray(preview_array)
 
-    crop_preview = Image.fromarray(
-        crop
-    )
+    crop_preview = Image.fromarray(crop)
 
-    binary_preview = Image.fromarray(
-        binary
-    )
+    binary_preview = Image.fromarray(binary)
 
     bbox = (
-        x,
-        y,
+        x_min,
+        y_min,
         cw,
         ch
     )
@@ -306,7 +280,6 @@ if uploaded is not None:
             bbox
         ) = preprocess_image(original)
 
-        # Original image
         st.subheader("Original Image")
 
         st.image(
@@ -320,7 +293,6 @@ if uploaded is not None:
             f"width={bbox[2]}, height={bbox[3]}"
         )
 
-        # Binary image
         st.subheader("Binary Image")
 
         st.image(
@@ -328,7 +300,6 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # Cropped handwriting
         st.subheader("Detected Handwriting")
 
         st.image(
@@ -336,7 +307,6 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # 6x6 centered in 8x8
         st.subheader("Processed 8×8 Image")
 
         st.image(
@@ -344,7 +314,7 @@ if uploaded is not None:
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="6×6 image centered inside an 8×8 canvas"
+            caption="Directly resized to 8×8"
         )
 
         # ==================================
@@ -432,9 +402,7 @@ if uploaded is not None:
         # 10. Display 8x8 pixel values
         # ==================================
 
-        st.subheader(
-            "8×8 Pixel Values (0–16)"
-        )
+        st.subheader("8×8 Pixel Values (0–16)")
 
         values = np.rint(
             model_input.reshape(8, 8)
@@ -444,6 +412,12 @@ if uploaded is not None:
             values,
             hide_index=True,
             use_container_width=True
+        )
+
+        st.caption(
+            f"Pixel range: "
+            f"{model_input.min():.2f} to "
+            f"{model_input.max():.2f}"
         )
 
         st.caption(
