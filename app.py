@@ -17,9 +17,10 @@ st.write("Compare KNN and SVM predictions for a handwritten digit.")
 
 @st.cache_resource
 def load_models():
-    knn = joblib.load("knn_model.joblib")
-    svm = joblib.load("svm_model.joblib")
-    return knn, svm
+    return (
+        joblib.load("knn_model.joblib"),
+        joblib.load("svm_model.joblib")
+    )
 
 
 @st.cache_data
@@ -45,22 +46,27 @@ c2.metric(
     f"{metrics['results']['svm']['accuracy'] * 100:.2f}%"
 )
 
-st.caption(
-    "Held-out dataset scores are not guarantees "
-    "for uploaded photographs."
-)
+st.caption("Dataset accuracy does not guarantee photo recognition accuracy.")
 
 
 def preprocess_image(image):
 
-    # 1. Correct orientation and convert to grayscale
+    # 1. Correct orientation and grayscale
     image = ImageOps.exif_transpose(image).convert("L")
     gray = np.asarray(image, dtype=np.uint8)
 
     h, w = gray.shape
+
+    # 2. Reduce small pencil/paper noise
+    blurred = cv2.GaussianBlur(
+        gray,
+        (3, 3),
+        0
+    )
+
+    # 3. Adaptive threshold
     min_side = min(h, w)
 
-    # 2. Adaptive thresholding
     block_size = min(51, min_side - 1)
 
     if block_size % 2 == 0:
@@ -69,7 +75,7 @@ def preprocess_image(image):
     block_size = max(3, block_size)
 
     binary = cv2.adaptiveThreshold(
-        gray,
+        blurred,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
@@ -77,109 +83,133 @@ def preprocess_image(image):
         7
     )
 
-    # 3. Remove very small noise
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+    # 4. Remove tiny components
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
         binary,
         connectivity=8
     )
 
-    cleaned = np.zeros_like(binary)
+    components = []
 
     for i in range(1, count):
 
-        area = stats[i, cv2.CC_STAT_AREA]
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
 
-        if area >= 4:
-            cleaned[labels == i] = 255
+        # Remove tiny background noise
+        if area < max(8, int(h * w * 0.00003)):
+            continue
 
-    # 4. Find overall digit boundaries
-    ys, xs = np.where(cleaned > 0)
+        # Ignore components touching image borders
+        if x <= 1 or y <= 1 or x + cw >= w - 1 or y + ch >= h - 1:
+            continue
 
-    if len(xs) == 0:
-        raise ValueError(
-            "No handwriting detected. Try a clearer image."
+        components.append(
+            (area, i, x, y, cw, ch)
         )
 
-    x_min = int(xs.min())
-    x_max = int(xs.max())
-    y_min = int(ys.min())
-    y_max = int(ys.max())
+    if not components:
+        raise ValueError(
+            "Could not detect handwriting. Please try another image."
+        )
 
-    crop = cleaned[
-        y_min:y_max + 1,
-        x_min:x_max + 1
+    # 5. Select the largest handwriting component
+    components.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    largest = components[0]
+
+    _, main_label, x, y, cw, ch = largest
+
+    # Keep the main connected handwriting component
+    main_mask = (
+        labels == main_label
+    ).astype(np.uint8) * 255
+
+    # 6. Crop tightly around actual handwriting
+    crop = main_mask[
+        y:y + ch,
+        x:x + cw
     ]
 
-    crop_h, crop_w = crop.shape
+    # 7. Add padding
+    padding = max(
+        2,
+        int(max(cw, ch) * 0.18)
+    )
 
-    # 5. Add padding and center
-    padding = max(2, int(max(crop_h, crop_w) * 0.18))
+    padded_w = cw + padding * 2
+    padded_h = ch + padding * 2
 
-    new_h = crop_h + 2 * padding
-    new_w = crop_w + 2 * padding
-
-    side = max(new_h, new_w)
+    side = max(
+        padded_w,
+        padded_h
+    )
 
     square = np.zeros(
         (side, side),
         dtype=np.uint8
     )
 
-    start_y = (side - crop_h) // 2
-    start_x = (side - crop_w) // 2
+    start_x = (side - cw) // 2
+    start_y = (side - ch) // 2
 
     square[
-        start_y:start_y + crop_h,
-        start_x:start_x + crop_w
+        start_y:start_y + ch,
+        start_x:start_x + cw
     ] = crop
 
-    # 6. Resize to 8x8 using area interpolation
+    # 8. Resize to 8x8
     small = cv2.resize(
         square,
         (8, 8),
         interpolation=cv2.INTER_AREA
     )
 
-    # 7. Brightness normalization
-    # Important: prevent very faint strokes from becoming values 1-3
+    # 9. Normalize brightness
     max_value = float(small.max())
 
     if max_value > 0:
 
-        normalized = (
+        small = (
             small.astype(np.float32)
             / max_value
             * 16.0
         )
 
-    else:
-
-        normalized = small.astype(np.float32)
-
-    # 8. Slight contrast adjustment
-    normalized = np.clip(
-        normalized,
+    small = np.clip(
+        small,
         0,
         16
     )
 
-    # Convert to model input
-    model_input = normalized.reshape(1, 64).astype(np.float32)
+    model_input = small.reshape(
+        1, 64
+    ).astype(np.float32)
 
-    # Preview
+    # 10. Preview
     preview_array = np.rint(
-        normalized / 16.0 * 255
+        small / 16 * 255
     ).astype(np.uint8)
 
-    preview = Image.fromarray(preview_array)
+    preview = Image.fromarray(
+        preview_array
+    )
 
-    crop_preview = Image.fromarray(crop)
+    crop_preview = Image.fromarray(
+        crop
+    )
 
     bbox = (
-        x_min,
-        y_min,
-        crop_w,
-        crop_h
+        x,
+        y,
+        cw,
+        ch
     )
 
     return (
@@ -194,7 +224,6 @@ uploaded = st.file_uploader(
     "Upload a handwritten digit photo",
     type=["png", "jpg", "jpeg"]
 )
-
 
 if uploaded is not None:
 
@@ -235,10 +264,10 @@ if uploaded is not None:
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="Same exact pixels used by both models"
+            caption="Shared input for both models"
         )
 
-        # Both models use the exact same input
+        # Same input for KNN and SVM
         knn_prediction = int(
             knn_model.predict(model_input)[0]
         )
@@ -258,12 +287,12 @@ if uploaded is not None:
             svm_model.classes_ == svm_prediction
         )[0][0]
 
-        knn_confidence = float(
-            knn_probs[knn_index] * 100
+        knn_confidence = (
+            float(knn_probs[knn_index]) * 100
         )
 
-        svm_confidence = float(
-            svm_probs[svm_index] * 100
+        svm_confidence = (
+            float(svm_probs[svm_index]) * 100
         )
 
         st.subheader("Predictions")
@@ -299,8 +328,7 @@ if uploaded is not None:
         else:
 
             st.warning(
-                "Models disagree. Try a clearer, "
-                "more centered handwritten digit."
+                "Models disagree. The image may be difficult to classify."
             )
 
         st.subheader("8×8 Pixel Values (0–16)")
@@ -316,8 +344,7 @@ if uploaded is not None:
         )
 
         st.caption(
-            "Confidence is an estimated probability, "
-            "not measured accuracy."
+            "Confidence is an estimated probability, not measured accuracy."
         )
 
     except Exception as error:
