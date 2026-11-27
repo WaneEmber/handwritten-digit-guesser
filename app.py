@@ -58,7 +58,7 @@ try:
 
 except Exception as error:
 
-    st.error(f"Could not load models or metrics: {error}")
+    st.error(f"Could not load models: {error}")
     st.stop()
 
 
@@ -86,7 +86,7 @@ st.caption(
 
 
 # ==========================================
-# 4. Image preprocessing
+# 4. OLD-STYLE IMAGE PREPROCESSING
 # ==========================================
 
 def preprocess_image(image):
@@ -102,30 +102,25 @@ def preprocess_image(image):
     h, w = gray.shape
 
     if min(h, w) < 3:
+        raise ValueError("Image is too small.")
 
-        raise ValueError(
-            "Image is too small."
-        )
-
-    # 2. Reduce small image noise
+    # 2. Gaussian Blur
     blurred = cv2.GaussianBlur(
         gray,
         (3, 3),
         0
     )
 
-    # 3. Adaptive threshold
+    # 3. Adaptive Threshold
     min_side = min(h, w)
 
     block_size = min(
         51,
-        min_side if min_side % 2 == 1 else min_side - 1
+        min_side if min_side % 2 == 1
+        else min_side - 1
     )
 
-    block_size = max(
-        3,
-        block_size
-    )
+    block_size = max(3, block_size)
 
     binary = cv2.adaptiveThreshold(
         blurred,
@@ -136,7 +131,7 @@ def preprocess_image(image):
         7
     )
 
-    # 4. Remove only tiny connected components
+    # 4. Connected Components
     count, labels, stats, centroids = (
         cv2.connectedComponentsWithStats(
             binary,
@@ -144,65 +139,69 @@ def preprocess_image(image):
         )
     )
 
-    clean_mask = np.zeros_like(binary)
-
-    min_area = max(
-        8,
-        int(h * w * 0.00003)
-    )
-
-    valid_components = []
+    components = []
 
     for i in range(1, count):
 
-        area = int(
-            stats[i, cv2.CC_STAT_AREA]
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        area = int(stats[i, cv2.CC_STAT_AREA])
+
+        # Ignore very small noise
+        if area < max(8, int(h * w * 0.00003)):
+            continue
+
+        # Ignore components touching image borders
+        if (
+            x <= 1
+            or y <= 1
+            or x + cw >= w - 1
+            or y + ch >= h - 1
+        ):
+            continue
+
+        components.append(
+            (area, i, x, y, cw, ch)
         )
 
-        if area >= min_area:
-
-            valid_components.append(i)
-
-            clean_mask[
-                labels == i
-            ] = 255
-
-    if not valid_components:
+    if not components:
 
         raise ValueError(
             "Could not detect handwriting. "
             "Please try another image."
         )
 
-    # 5. Bounding box of all retained components
-    ys, xs = np.where(
-        clean_mask > 0
+    # 5. Select largest connected component
+    components.sort(
+        key=lambda item: item[0],
+        reverse=True
     )
 
-    x1 = int(xs.min())
-    x2 = int(xs.max()) + 1
+    largest = components[0]
 
-    y1 = int(ys.min())
-    y2 = int(ys.max()) + 1
+    _, main_label, x, y, cw, ch = largest
 
-    crop = clean_mask[
-        y1:y2,
-        x1:x2
+    main_mask = (
+        labels == main_label
+    ).astype(np.uint8) * 255
+
+    # 6. Crop handwriting
+    crop = main_mask[
+        y:y + ch,
+        x:x + cw
     ]
 
-    cw = x2 - x1
-    ch = y2 - y1
-
-    # 6. Add padding and create square image
+    # 7. Make a square image with padding
     padding = max(
         2,
         int(max(cw, ch) * 0.18)
     )
 
-    side = max(
-        cw,
-        ch
-    ) + padding * 2
+    side = max(cw, ch) + padding * 2
 
     square = np.zeros(
         (side, side),
@@ -217,34 +216,38 @@ def preprocess_image(image):
         start_x:start_x + cw
     ] = crop
 
-    # 7. Resize to 8x8
+    # 8. Resize to 6x6
     small = cv2.resize(
         square,
-        (8, 8),
+        (6, 6),
         interpolation=cv2.INTER_AREA
     )
 
-    # 8. Map grayscale values to 0-16
-    small = (
-        small.astype(np.float32)
-        / 255.0
-        * 16.0
+    # 9. Put 6x6 image in the center of 8x8
+    final_image = np.zeros(
+        (8, 8),
+        dtype=np.float32
     )
 
-    small = np.clip(
-        small,
+    final_image[1:7, 1:7] = (
+        small.astype(np.float32) / 255.0 * 16.0
+    )
+
+    final_image = np.clip(
+        final_image,
         0,
         16
     )
 
-    model_input = small.reshape(
+    # 10. Model input
+    model_input = final_image.reshape(
         1,
         64
     ).astype(np.float32)
 
-    # 9. Create 8x8 preview
+    # 11. Preview
     preview_array = np.rint(
-        small / 16.0 * 255
+        final_image / 16.0 * 255
     ).astype(np.uint8)
 
     preview = Image.fromarray(
@@ -260,8 +263,8 @@ def preprocess_image(image):
     )
 
     bbox = (
-        x1,
-        y1,
+        x,
+        y,
         cw,
         ch
     )
@@ -281,25 +284,19 @@ def preprocess_image(image):
 
 uploaded = st.file_uploader(
     "Upload a handwritten digit photo",
-    type=[
-        "png",
-        "jpg",
-        "jpeg"
-    ]
+    type=["png", "jpg", "jpeg"]
 )
 
 
 # ==========================================
-# 6. Process and predict
+# 6. Image processing
 # ==========================================
 
 if uploaded is not None:
 
     try:
 
-        original = Image.open(
-            uploaded
-        )
+        original = Image.open(uploaded)
 
         (
             model_input,
@@ -319,10 +316,8 @@ if uploaded is not None:
 
         st.caption(
             f"Detected area: "
-            f"x={bbox[0]}, "
-            f"y={bbox[1]}, "
-            f"width={bbox[2]}, "
-            f"height={bbox[3]}"
+            f"x={bbox[0]}, y={bbox[1]}, "
+            f"width={bbox[2]}, height={bbox[3]}"
         )
 
         # Binary image
@@ -333,7 +328,7 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # Detected handwriting
+        # Cropped handwriting
         st.subheader("Detected Handwriting")
 
         st.image(
@@ -341,7 +336,7 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # Processed 8x8 image
+        # 6x6 centered in 8x8
         st.subheader("Processed 8×8 Image")
 
         st.image(
@@ -349,7 +344,7 @@ if uploaded is not None:
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="Shared input for KNN and SVM"
+            caption="6×6 image centered inside an 8×8 canvas"
         )
 
         # ==================================
@@ -357,9 +352,7 @@ if uploaded is not None:
         # ==================================
 
         knn_prediction = int(
-            knn_model.predict(
-                model_input
-            )[0]
+            knn_model.predict(model_input)[0]
         )
 
         knn_probs = knn_model.predict_proba(
@@ -379,9 +372,7 @@ if uploaded is not None:
         # ==================================
 
         svm_prediction = int(
-            svm_model.predict(
-                model_input
-            )[0]
+            svm_model.predict(model_input)[0]
         )
 
         svm_probs = svm_model.predict_proba(
@@ -424,7 +415,6 @@ if uploaded is not None:
             f"{svm_confidence:.2f}%"
         )
 
-        # Compare models
         if knn_prediction == svm_prediction:
 
             st.success(
