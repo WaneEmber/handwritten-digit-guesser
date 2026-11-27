@@ -68,14 +68,12 @@ def otsu_threshold(array):
 
 # Preprocess uploaded image
 def preprocess_image(image):
-
-    # Correct orientation and convert to grayscale
     image = ImageOps.exif_transpose(image)
     image = ImageOps.grayscale(image)
 
-    img_array = np.array(image, dtype=np.uint8)
+    img_array = np.array(image)
 
-    # Estimate background brightness from image borders
+    # Detect background using border brightness
     border = np.concatenate([
         img_array[0, :],
         img_array[-1, :],
@@ -83,105 +81,40 @@ def preprocess_image(image):
         img_array[:, -1]
     ])
 
-    background = float(np.median(border))
-    image_median = float(np.median(img_array))
+    # White/light background -> invert
+    if np.median(border) > 127:
+        img_array = 255 - img_array
 
-    # Detect digit polarity
-    if background > image_median:
-        # Dark digit on bright background
-        contrast = background - img_array
-    else:
-        # Bright digit on dark background
-        contrast = img_array - background
+    # Find digit area
+    threshold = max(20, int(img_array.max() * 0.15))
 
-    contrast = np.clip(contrast, 0, 255).astype(np.uint8)
+    ys, xs = np.where(img_array > threshold)
 
-    # Improve contrast using the stronger digit pixels
-    nonzero = contrast[contrast > 0]
-
-    if len(nonzero) == 0:
-        raise ValueError(
-            "No digit detected. Please upload a clearer image."
-        )
-
-    upper = float(np.percentile(nonzero, 95))
-
-    if upper <= 0:
-        raise ValueError(
-            "The image has insufficient contrast."
-        )
-
-    enhanced = np.clip(
-        contrast.astype(np.float32) / upper * 255,
-        0,
-        255
-    ).astype(np.uint8)
-
-    # Automatically determine foreground threshold
-    otsu = otsu_threshold(enhanced)
-
-    threshold = max(
-        15,
-        otsu,
-        int(enhanced.max() * 0.12)
-    )
-
-    # Detect digit pixels
-    mask = enhanced > threshold
-
-    if not np.any(mask):
-        raise ValueError(
-            "No clear digit detected. Please upload another image."
-        )
-
-    # Find digit boundaries
-    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        raise ValueError("No clear digit detected.")
 
     x_min, x_max = xs.min(), xs.max()
     y_min, y_max = ys.min(), ys.max()
 
-    # Crop the digit
-    cropped = enhanced[
-        y_min:y_max + 1,
-        x_min:x_max + 1
-    ]
-
-    cropped_mask = mask[
-        y_min:y_max + 1,
-        x_min:x_max + 1
-    ]
-
-    # Remove pixels outside the detected digit
-    cropped = np.where(
-        cropped_mask,
-        cropped,
-        0
-    ).astype(np.uint8)
-
-    digit = Image.fromarray(cropped)
-
-    # Resize while preserving aspect ratio
-    digit.thumbnail(
-        (7, 7),
-        Image.Resampling.LANCZOS
+    digit = Image.fromarray(
+        img_array[y_min:y_max + 1, x_min:x_max + 1]
     )
 
-    # Place digit in the center of an 8x8 canvas
+    # Preserve aspect ratio
+    digit.thumbnail((7, 7), Image.Resampling.LANCZOS)
+
+    # Center on black canvas
     canvas = Image.new("L", (8, 8), 0)
 
     x_offset = (8 - digit.width) // 2
     y_offset = (8 - digit.height) // 2
 
-    canvas.paste(
-        digit,
-        (x_offset, y_offset)
-    )
+    canvas.paste(digit, (x_offset, y_offset))
 
-    # Convert pixels to sklearn digits range (0-16)
+    # Convert to 0-16 range
     processed = (
         np.array(canvas, dtype=np.float64)
-        / 255.0
-        * 16.0
+        / 255.0 * 16.0
     )
 
     return processed.reshape(1, 64), canvas
