@@ -19,72 +19,90 @@ def load_metrics():
 
 knn_model, svm_model = load_models()
 metrics = load_metrics()
-
 st.subheader("Model Test-Set Performance")
 m1, m2 = st.columns(2)
 m1.metric("KNN Accuracy", f"{metrics['results']['knn']['accuracy']*100:.2f}%")
 m2.metric("SVM Accuracy", f"{metrics['results']['svm']['accuracy']*100:.2f}%")
-st.caption("Held-out dataset scores; uploaded-photo performance may differ.")
+st.caption("Scores are measured on a held-out dataset; uploaded-photo accuracy can differ.")
+
 
 def preprocess_image(image):
+    """Extract dark strokes using local-background subtraction, then center on 8x8."""
     image = ImageOps.exif_transpose(image).convert("L")
-    arr = np.asarray(image, dtype=np.uint8)
-    sigma = max(4, min(image.size) / 30)
-    background = cv2.GaussianBlur(arr, (0, 0), sigmaX=sigma)
-    difference = cv2.subtract(background, arr)
+    gray = np.asarray(image, dtype=np.uint8)
+    h_img, w_img = gray.shape
+
+    # Scale the blur with image size to estimate uneven paper illumination.
+    sigma = max(4.0, min(h_img, w_img) / 30.0)
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
+    difference = cv2.subtract(background, gray)
     positive = difference[difference > 0]
     if positive.size == 0:
-        raise ValueError("No dark strokes detected. Try a clearer photo.")
+        raise ValueError("No dark strokes found. Try a clearer image.")
 
+    # Threshold weak texture; keep pencil strokes and their connected shape.
     threshold = max(5, int(np.percentile(positive, 75)))
     binary = (difference > threshold).astype(np.uint8)
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
-    H, W = binary.shape
-    candidates = []
-    for component_id, stat in enumerate(stats[1:], start=1):
-        x, y, w, h, area = [int(v) for v in stat]
-        if area >= 30 and x > 0 and y > 0 and x+w < W and y+h < H:
-            candidates.append((component_id, x, y, w, h, area))
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
 
-    if candidates:
-        component_id, x, y, w, h, _ = max(candidates, key=lambda item: item[5])
-        component = labels[y:y+h, x:x+w] == component_id
-        crop = np.where(component, difference[y:y+h, x:x+w], 0).astype(np.uint8)
-    else:
+    # Exclude edge-touching components and tiny noise. The largest remaining
+    # plausible component is usually the handwritten digit.
+    candidates = []
+    for label in range(1, n_labels):
+        x, y, w, h, area = map(int, stats[label])
+        if area >= 30 and x > 0 and y > 0 and x + w < w_img and y + h < h_img:
+            if w >= 5 and h >= 8 and area < (h_img * w_img * 0.08):
+                candidates.append((label, x, y, w, h, area))
+
+    if not candidates:
         ys, xs = np.where(binary > 0)
-        if len(xs) == 0:
-            raise ValueError("Could not isolate digit. Try cropping closer.")
+        if xs.size == 0:
+            raise ValueError("Could not isolate the digit. Try a closer crop.")
         x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
         crop = np.where(binary[y0:y1+1, x0:x1+1], difference[y0:y1+1, x0:x1+1], 0).astype(np.uint8)
+        bbox = (int(x0), int(y0), int(x1-x0+1), int(y1-y0+1))
+    else:
+        label, x, y, w, h, _ = max(candidates, key=lambda item: item[5])
+        component = labels[y:y+h, x:x+w] == label
+        crop = np.where(component, difference[y:y+h, x:x+w], 0).astype(np.uint8)
+        bbox = (x, y, w, h)
 
     if crop.max() == 0:
-        raise ValueError("Detected region is too faint. Try a clearer photo.")
-    crop = (crop.astype(np.float32) / float(crop.max()) * 255).astype(np.uint8)
+        raise ValueError("Detected strokes are too faint. Try a clearer photo.")
 
+    # Normalize extracted strokes before resampling. This avoids pencil gray
+    # values collapsing to nearly-zero pixels on the 8x8 input.
+    crop = (crop.astype(np.float32) / float(crop.max()) * 255).astype(np.uint8)
     ch, cw = crop.shape
     side = max(ch, cw)
-    square = Image.new("L", (side, side), 0)
-    square.paste(Image.fromarray(crop), ((side-cw)//2, (side-ch)//2))
-    square.thumbnail((6, 6), Image.Resampling.LANCZOS)
-    base_canvas = Image.new("L", (8, 8), 0)
-    base_canvas.paste(square, ((8-square.width)//2, (8-square.height)//2))
+    square = np.zeros((side, side), dtype=np.uint8)
+    square[(side-ch)//2:(side-ch)//2+ch, (side-cw)//2:(side-cw)//2+cw] = crop
 
-    # Keep softer contrast for KNN; normalize resized intensity for SVM.
-    knn_canvas = base_canvas.copy()
-    knn_data = np.asarray(knn_canvas, dtype=np.float32).reshape(1, 64) / 255.0 * 16.0
-    base = np.asarray(base_canvas, dtype=np.float32)
-    svm_canvas = Image.fromarray(np.clip(base / max(float(base.max()), 1) * 255, 0, 255).astype(np.uint8))
-    svm_data = np.asarray(svm_canvas, dtype=np.float32).reshape(1, 64) / 255.0 * 16.0
-    return knn_data, svm_data, knn_canvas, svm_canvas
+    # Fit within 6x6, leaving a 1-pixel margin in the 8x8 canvas.
+    small = cv2.resize(square, (6, 6), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((8, 8), dtype=np.uint8)
+    canvas[1:7, 1:7] = small
+
+    # KNN keeps the normalized soft pixel intensities; SVM receives the same
+    # shape with intensity scaled to the full 0..16 range.
+    knn_data = canvas.astype(np.float32).reshape(1, 64) / 255.0 * 16.0
+    svm_data = canvas.astype(np.float32).reshape(1, 64) / max(float(canvas.max()), 1.0) * 16.0
+    cropped_preview = Image.fromarray(crop)
+    knn_preview = Image.fromarray(canvas)
+    svm_preview = Image.fromarray(np.clip(canvas.astype(float) / max(float(canvas.max()), 1.0) * 255, 0, 255).astype(np.uint8))
+    return knn_data, svm_data, cropped_preview, knn_preview, svm_preview, bbox
 
 uploaded = st.file_uploader("Upload a digit photo (PNG/JPG/JPEG)", type=["png", "jpg", "jpeg"])
 if uploaded:
     try:
         original = Image.open(uploaded)
-        knn_input, svm_input, knn_canvas, svm_canvas = preprocess_image(original)
+        knn_input, svm_input, crop_preview, knn_canvas, svm_canvas, bbox = preprocess_image(original)
         st.subheader("Uploaded Photo")
-        st.image(original, caption="Original image", use_container_width=True)
-        st.subheader("Processed Model Inputs")
+        st.image(original, caption="Original uploaded image", use_container_width=True)
+        st.caption(f"Detected region: x={bbox[0]}, y={bbox[1]}, width={bbox[2]}, height={bbox[3]}")
+        st.subheader("Detected Digit Crop")
+        st.image(crop_preview, caption="Extracted stroke region", use_container_width=True)
+        st.subheader("Processed 8×8 Inputs")
         c1, c2 = st.columns(2)
         c1.image(knn_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="KNN input")
         c2.image(svm_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="SVM input")
@@ -107,12 +125,12 @@ if uploaded:
             st.warning("Models disagree. Try a closer crop with the digit centered and clear.")
 
         st.subheader("8×8 Pixel Values (0–16)")
-        t1, t2 = st.columns(2)
-        t1.write("KNN input")
-        t1.dataframe(np.rint(np.asarray(knn_canvas, dtype=float)/255*16).astype(int), hide_index=True)
-        t2.write("SVM input")
-        t2.dataframe(np.rint(np.asarray(svm_canvas, dtype=float)/255*16).astype(int), hide_index=True)
-        st.caption("Confidence is the model-estimated probability, not measured accuracy. Photo inputs may differ from the training dataset.")
+        c1, c2 = st.columns(2)
+        c1.write("KNN input")
+        c1.dataframe(np.rint(np.asarray(knn_canvas, dtype=float) / 255 * 16).astype(int), hide_index=True)
+        c2.write("SVM input")
+        c2.dataframe(np.rint(np.asarray(svm_canvas, dtype=float) / 255 * 16).astype(int), hide_index=True)
+        st.caption("Confidence is a model-estimated probability, not measured accuracy. Real-photo performance can differ from the held-out dataset.")
     except Exception as err:
         st.error(f"Image processing failed: {err}")
 
