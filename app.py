@@ -1,5 +1,6 @@
 import streamlit as st
-import joblib, json
+import joblib
+import json
 import numpy as np
 import cv2
 from PIL import Image, ImageOps
@@ -20,119 +21,104 @@ def load_metrics():
 knn_model, svm_model = load_models()
 metrics = load_metrics()
 st.subheader("Model Test-Set Performance")
-m1, m2 = st.columns(2)
-m1.metric("KNN Accuracy", f"{metrics['results']['knn']['accuracy']*100:.2f}%")
-m2.metric("SVM Accuracy", f"{metrics['results']['svm']['accuracy']*100:.2f}%")
-st.caption("Scores are measured on a held-out dataset; uploaded-photo accuracy can differ.")
+c1, c2 = st.columns(2)
+c1.metric("KNN Accuracy", f"{metrics['results']['knn']['accuracy'] * 100:.2f}%")
+c2.metric("SVM Accuracy", f"{metrics['results']['svm']['accuracy'] * 100:.2f}%")
+st.caption("Held-out dataset scores are not guarantees for uploaded photographs.")
 
 
 def preprocess_image(image):
-    """Extract dark strokes using local-background subtraction, then center on 8x8."""
+    """One shared input: adaptive threshold -> largest plausible component -> thicken -> 8x8."""
     image = ImageOps.exif_transpose(image).convert("L")
     gray = np.asarray(image, dtype=np.uint8)
-    h_img, w_img = gray.shape
+    h, w = gray.shape
+    min_side = min(h, w)
+    block = max(31, min(61, (min_side // 8) | 1))
+    if block >= min_side:
+        block = max(3, (min_side - 1) | 1)
+    c_value = 9 if min_side > 500 else 5
 
-    # Scale the blur with image size to estimate uneven paper illumination.
-    sigma = max(4.0, min(h_img, w_img) / 30.0)
-    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
-    difference = cv2.subtract(background, gray)
-    positive = difference[difference > 0]
-    if positive.size == 0:
-        raise ValueError("No dark strokes found. Try a clearer image.")
-
-    # Threshold weak texture; keep pencil strokes and their connected shape.
-    threshold = max(5, int(np.percentile(positive, 75)))
-    binary = (difference > threshold).astype(np.uint8)
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-
-    # Exclude edge-touching components and tiny noise. The largest remaining
-    # plausible component is usually the handwritten digit.
+    # Adaptive threshold keeps pencil strokes despite uneven paper illumination.
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, block, c_value
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     candidates = []
-    for label in range(1, n_labels):
-        x, y, w, h, area = map(int, stats[label])
-        if area >= 30 and x > 0 and y > 0 and x + w < w_img and y + h < h_img:
-            if w >= 5 and h >= 8 and area < (h_img * w_img * 0.08):
-                candidates.append((label, x, y, w, h, area))
-
+    for label in range(1, count):
+        x, y, cw, ch, area = map(int, stats[label])
+        ratio = cw / max(ch, 1)
+        # Ignore frame/edge noise and tiny specks; prefer digit-like components.
+        if (x > 0 and y > 0 and x + cw < w and y + ch < h
+                and area >= 30 and cw >= 5 and ch >= 8
+                and 0.12 <= ratio <= 1.25):
+            candidates.append((area, label, x, y, cw, ch))
     if not candidates:
-        ys, xs = np.where(binary > 0)
-        if xs.size == 0:
-            raise ValueError("Could not isolate the digit. Try a closer crop.")
-        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
-        crop = np.where(binary[y0:y1+1, x0:x1+1], difference[y0:y1+1, x0:x1+1], 0).astype(np.uint8)
-        bbox = (int(x0), int(y0), int(x1-x0+1), int(y1-y0+1))
-    else:
-        label, x, y, w, h, _ = max(candidates, key=lambda item: item[5])
-        component = labels[y:y+h, x:x+w] == label
-        crop = np.where(component, difference[y:y+h, x:x+w], 0).astype(np.uint8)
-        bbox = (x, y, w, h)
+        raise ValueError("Could not isolate a digit. Try a closer, clearer photo with the digit away from the edges.")
 
-    if crop.max() == 0:
-        raise ValueError("Detected strokes are too faint. Try a clearer photo.")
+    area, label, x, y, cw, ch = max(candidates, key=lambda item: item[0])
+    component = (labels[y:y + ch, x:x + cw] == label).astype(np.uint8) * 255
 
-    # Normalize extracted strokes before resampling. This avoids pencil gray
-    # values collapsing to nearly-zero pixels on the 8x8 input.
-    crop = (crop.astype(np.float32) / float(crop.max()) * 255).astype(np.uint8)
-    ch, cw = crop.shape
-    side = max(ch, cw)
+    # Thicken thin pencil strokes before shrinking. This preserves loop structure
+    # better than enhancing a blurred grayscale crop.
+    component = cv2.dilate(component, np.ones((3, 3), np.uint8), iterations=2)
+    side = max(cw, ch)
     square = np.zeros((side, side), dtype=np.uint8)
-    square[(side-ch)//2:(side-ch)//2+ch, (side-cw)//2:(side-cw)//2+cw] = crop
+    px, py = (side - cw) // 2, (side - ch) // 2
+    square[py:py + ch, px:px + cw] = component
 
-    # Fit within 6x6, leaving a 1-pixel margin in the 8x8 canvas.
-    small = cv2.resize(square, (6, 6), interpolation=cv2.INTER_AREA)
+    # Empirically tested fit: 7x7 with the remaining pixel at bottom/right.
+    small = cv2.resize(square, (7, 7), interpolation=cv2.INTER_AREA)
     canvas = np.zeros((8, 8), dtype=np.uint8)
-    canvas[1:7, 1:7] = small
+    canvas[:7, :7] = small
+    # Scale to the Digits dataset's 0..16 range. Both models get exactly this array.
+    pixel_data = canvas.astype(np.float32) / 255.0 * 16.0
+    crop_preview = Image.fromarray(component)
+    # Bright display-only preview; the actual shared model input stays 0..16.
+    display_canvas = (canvas.astype(np.float32) / max(float(canvas.max()), 1.0) * 255).astype(np.uint8)
+    preview = Image.fromarray(display_canvas)
+    bbox = (x, y, cw, ch)
+    return pixel_data.reshape(1, 64), crop_preview, preview, bbox
 
-    # KNN keeps the normalized soft pixel intensities; SVM receives the same
-    # shape with intensity scaled to the full 0..16 range.
-    knn_data = canvas.astype(np.float32).reshape(1, 64) / 255.0 * 16.0
-    svm_data = canvas.astype(np.float32).reshape(1, 64) / max(float(canvas.max()), 1.0) * 16.0
-    cropped_preview = Image.fromarray(crop)
-    knn_preview = Image.fromarray(canvas)
-    svm_preview = Image.fromarray(np.clip(canvas.astype(float) / max(float(canvas.max()), 1.0) * 255, 0, 255).astype(np.uint8))
-    return knn_data, svm_data, cropped_preview, knn_preview, svm_preview, bbox
 
-uploaded = st.file_uploader("Upload a digit photo (PNG/JPG/JPEG)", type=["png", "jpg", "jpeg"])
-if uploaded:
+uploaded = st.file_uploader("Upload a handwritten digit photo", type=["png", "jpg", "jpeg"])
+if uploaded is not None:
     try:
         original = Image.open(uploaded)
-        knn_input, svm_input, crop_preview, knn_canvas, svm_canvas, bbox = preprocess_image(original)
-        st.subheader("Uploaded Photo")
-        st.image(original, caption="Original uploaded image", use_container_width=True)
-        st.caption(f"Detected region: x={bbox[0]}, y={bbox[1]}, width={bbox[2]}, height={bbox[3]}")
-        st.subheader("Detected Digit Crop")
-        st.image(crop_preview, caption="Extracted stroke region", use_container_width=True)
-        st.subheader("Processed 8×8 Inputs")
-        c1, c2 = st.columns(2)
-        c1.image(knn_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="KNN input")
-        c2.image(svm_canvas.resize((320, 320), Image.Resampling.NEAREST), caption="SVM input")
+        model_input, crop_preview, preview, bbox = preprocess_image(original)
+        st.subheader("Original Image")
+        st.image(original, use_container_width=True)
+        st.caption(f"Detected component: x={bbox[0]}, y={bbox[1]}, width={bbox[2]}, height={bbox[3]}")
+        st.subheader("Detected Stroke Crop")
+        st.image(crop_preview, use_container_width=True)
+        st.subheader("Shared Processed 8×8 Input")
+        st.image(preview.resize((320, 320), Image.Resampling.NEAREST), caption="Same exact 8×8 pixels are used by KNN and SVM")
 
-        kp = int(knn_model.predict(knn_input)[0])
-        sp = int(svm_model.predict(svm_input)[0])
-        kprob = knn_model.predict_proba(knn_input)[0]
-        sprob = svm_model.predict_proba(svm_input)[0]
-        kconf = float(kprob[np.where(knn_model.classes_ == kp)[0][0]]) * 100
-        sconf = float(sprob[np.where(svm_model.classes_ == sp)[0][0]]) * 100
+        # IMPORTANT: one input array, passed unchanged to both models.
+        knn_prediction = int(knn_model.predict(model_input)[0])
+        svm_prediction = int(svm_model.predict(model_input)[0])
+        knn_probs = knn_model.predict_proba(model_input)[0]
+        svm_probs = svm_model.predict_proba(model_input)[0]
+        knn_confidence = float(knn_probs[np.where(knn_model.classes_ == knn_prediction)[0][0]]) * 100
+        svm_confidence = float(svm_probs[np.where(svm_model.classes_ == svm_prediction)[0][0]]) * 100
+
         st.subheader("Predictions")
         c1, c2 = st.columns(2)
-        c1.metric("KNN Prediction", kp)
-        c1.write(f"Estimated model confidence: {kconf:.2f}%")
-        c2.metric("SVM Prediction", sp)
-        c2.write(f"Estimated model confidence: {sconf:.2f}%")
-        if kp == sp:
-            st.success(f"Both models agree: {kp}")
+        c1.metric("KNN Prediction", knn_prediction)
+        c1.write(f"Estimated model confidence: {knn_confidence:.2f}%")
+        c2.metric("SVM Prediction", svm_prediction)
+        c2.write(f"Estimated model confidence: {svm_confidence:.2f}%")
+        if knn_prediction == svm_prediction:
+            st.success(f"Both models agree: {knn_prediction}")
         else:
             st.warning("Models disagree. Try a closer crop with the digit centered and clear.")
 
-        st.subheader("8×8 Pixel Values (0–16)")
-        c1, c2 = st.columns(2)
-        c1.write("KNN input")
-        c1.dataframe(np.rint(np.asarray(knn_canvas, dtype=float) / 255 * 16).astype(int), hide_index=True)
-        c2.write("SVM input")
-        c2.dataframe(np.rint(np.asarray(svm_canvas, dtype=float) / 255 * 16).astype(int), hide_index=True)
-        st.caption("Confidence is a model-estimated probability, not measured accuracy. Real-photo performance can differ from the held-out dataset.")
-    except Exception as err:
-        st.error(f"Image processing failed: {err}")
+        st.subheader("Shared 8×8 Pixel Values (0–16)")
+        values = np.rint(model_input.reshape(8, 8)).astype(int)
+        st.dataframe(values, hide_index=True, use_container_width=True)
+        st.caption("Confidence is an estimated probability, not measured accuracy. Real-photo performance can differ from held-out dataset results.")
+    except Exception as error:
+        st.error(f"Image processing failed: {error}")
 
 st.markdown("---")
 st.caption("Course project: handwritten digit classification using KNN and SVM.")
