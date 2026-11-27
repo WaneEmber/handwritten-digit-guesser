@@ -81,12 +81,12 @@ st.caption(
 
 
 # ==========================================
-# 4. Improved image preprocessing
+# 4. Image preprocessing
 # ==========================================
 
 def preprocess_image(image):
 
-    # 1. Correct orientation and convert to grayscale
+    # 1. Orientation and grayscale
     image = ImageOps.exif_transpose(image).convert("L")
 
     gray = np.asarray(image, dtype=np.uint8)
@@ -122,7 +122,7 @@ def preprocess_image(image):
         7
     )
 
-    # 4. Remove very small noise, but keep all meaningful components
+    # 4. Connected components
     count, labels, stats, centroids = (
         cv2.connectedComponentsWithStats(
             binary,
@@ -137,6 +137,7 @@ def preprocess_image(image):
         int(h * w * 0.00003)
     )
 
+    # Keep all meaningful components
     for i in range(1, count):
 
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -144,13 +145,12 @@ def preprocess_image(image):
         if area >= min_area:
             foreground[labels == i] = 255
 
-    # 5. Find the bounding box of all handwriting
+    # 5. Find all handwriting pixels
     ys, xs = np.where(foreground > 0)
 
     if len(xs) == 0:
         raise ValueError(
-            "Could not detect handwriting. "
-            "Please try another image."
+            "No handwriting detected. Please try another image."
         )
 
     x_min = int(xs.min())
@@ -162,88 +162,89 @@ def preprocess_image(image):
     cw = x_max - x_min + 1
     ch = y_max - y_min + 1
 
-    # 6. Crop all handwriting
+    # 6. Crop handwriting
     crop = foreground[
         y_min:y_max + 1,
         x_min:x_max + 1
     ]
 
-    # 7. Make a square canvas
-    padding = max(
-        2,
-        int(max(cw, ch) * 0.15)
+    # 7. Resize while preserving aspect ratio
+    # Keep the digit within 6x6 pixels.
+    target_size = 6
+
+    scale = target_size / max(cw, ch)
+
+    new_w = max(1, int(round(cw * scale)))
+    new_h = max(1, int(round(ch * scale)))
+
+    interpolation = (
+        cv2.INTER_AREA
+        if scale < 1
+        else cv2.INTER_LINEAR
     )
 
-    side = max(cw, ch) + padding * 2
-
-    square = np.zeros(
-        (side, side),
-        dtype=np.uint8
+    resized = cv2.resize(
+        crop,
+        (new_w, new_h),
+        interpolation=interpolation
     )
 
-    start_x = (side - cw) // 2
-    start_y = (side - ch) // 2
-
-    square[
-        start_y:start_y + ch,
-        start_x:start_x + cw
-    ] = crop
-
-    # 8. First resize to 24x24
-    medium = cv2.resize(
-        square,
-        (24, 24),
-        interpolation=cv2.INTER_AREA
-    )
-
-    # 9. Strengthen thin strokes at this intermediate size
-    kernel = np.ones(
-        (3, 3),
-        dtype=np.uint8
-    )
-
-    medium = cv2.dilate(
-        medium,
-        kernel,
-        iterations=1
-    )
-
-    # 10. Resize from 24x24 to 8x8
-    small = cv2.resize(
-        medium,
+    # 8. Put the digit into an 8x8 canvas
+    canvas = np.zeros(
         (8, 8),
-        interpolation=cv2.INTER_AREA
+        dtype=np.float32
     )
 
-    # 11. Contrast normalization
-    small_float = small.astype(np.float32)
+    start_x = (8 - new_w) // 2
+    start_y = (8 - new_h) // 2
 
-    max_value = float(small_float.max())
+    canvas[
+        start_y:start_y + new_h,
+        start_x:start_x + new_w
+    ] = resized.astype(np.float32)
 
-    if max_value <= 0:
-        raise ValueError(
-            "The handwriting disappeared during resizing. "
-            "Please use a clearer image."
+    # 9. Center by center of mass
+    moments = cv2.moments(canvas)
+
+    if moments["m00"] > 0:
+
+        center_x = moments["m10"] / moments["m00"]
+        center_y = moments["m01"] / moments["m00"]
+
+        target_x = 3.5
+        target_y = 3.5
+
+        shift_x = target_x - center_x
+        shift_y = target_y - center_y
+
+        transform = np.float32([
+            [1, 0, shift_x],
+            [0, 1, shift_y]
+        ])
+
+        canvas = cv2.warpAffine(
+            canvas,
+            transform,
+            (8, 8),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
         )
 
-    # Map the brightest pixel to 16
-    final_image = (
-        small_float / max_value * 16.0
-    )
-
+    # 10. Convert 0-255 to 0-16
     final_image = np.clip(
-        final_image,
+        canvas / 255.0 * 16.0,
         0,
         16
     )
 
-    # 12. Model input
+    # 11. Model input
     model_input = final_image.reshape(
         1,
         64
     ).astype(np.float32)
 
-    # 13. Preview
+    # 12. Preview
     preview_array = np.rint(
         final_image / 16.0 * 255
     ).astype(np.uint8)
@@ -253,6 +254,8 @@ def preprocess_image(image):
     crop_preview = Image.fromarray(crop)
 
     binary_preview = Image.fromarray(binary)
+
+    resized_preview = Image.fromarray(resized)
 
     bbox = (
         x_min,
@@ -266,6 +269,7 @@ def preprocess_image(image):
         crop_preview,
         preview,
         binary_preview,
+        resized_preview,
         bbox
     )
 
@@ -295,10 +299,10 @@ if uploaded is not None:
             crop_preview,
             preview,
             binary_preview,
+            resized_preview,
             bbox
         ) = preprocess_image(original)
 
-        # Original image
         st.subheader("Original Image")
 
         st.image(
@@ -312,7 +316,6 @@ if uploaded is not None:
             f"width={bbox[2]}, height={bbox[3]}"
         )
 
-        # Binary image
         st.subheader("Binary Image")
 
         st.image(
@@ -320,7 +323,6 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # Cropped handwriting
         st.subheader("Detected Handwriting")
 
         st.image(
@@ -328,7 +330,15 @@ if uploaded is not None:
             use_container_width=True
         )
 
-        # Processed image
+        st.subheader("Resized Digit")
+
+        st.image(
+            resized_preview.resize(
+                (240, 240),
+                Image.Resampling.NEAREST
+            )
+        )
+
         st.subheader("Processed 8×8 Image")
 
         st.image(
@@ -336,7 +346,7 @@ if uploaded is not None:
                 (320, 320),
                 Image.Resampling.NEAREST
             ),
-            caption="24×24 intermediate image converted to 8×8"
+            caption="Aspect ratio preserved and center of mass adjusted"
         )
 
         # ==================================
@@ -380,7 +390,7 @@ if uploaded is not None:
         )
 
         # ==================================
-        # 9. Display predictions
+        # 9. Predictions
         # ==================================
 
         st.subheader("Predictions")
@@ -421,7 +431,7 @@ if uploaded is not None:
             )
 
         # ==================================
-        # 10. Display pixel values
+        # 10. Pixel values
         # ==================================
 
         st.subheader("8×8 Pixel Values (0–16)")
