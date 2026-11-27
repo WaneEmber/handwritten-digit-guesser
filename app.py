@@ -8,11 +8,6 @@ import json
 from pathlib import Path
 from PIL import Image
 
-
-# ==========================================
-# 页面设置
-# ==========================================
-
 st.set_page_config(
     page_title="Handwritten Digit Guesser",
     page_icon="✍️",
@@ -20,14 +15,14 @@ st.set_page_config(
 )
 
 st.title("✍️ Handwritten Digit Guesser")
-st.write("上传手写数字图片，使用 KNN 和 SVM 模型进行识别。")
+st.write("上传一张手写数字图片进行识别。")
 
 BASE_DIR = Path(__file__).resolve().parent
 
 
-# ==========================================
+# ======================================
 # 加载模型
-# ==========================================
+# ======================================
 
 @st.cache_resource
 def load_models():
@@ -47,19 +42,19 @@ except Exception as e:
     st.stop()
 
 
-# ==========================================
+# ======================================
 # 图片预处理
-# ==========================================
+# ======================================
 
 def preprocess_image(image):
 
-    # 1. 转换成灰度图
+    # 1. 转为灰度图
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
     h, w = gray.shape
 
-    # 2. 根据图片边缘判断背景亮度
+    # 2. 根据边缘估算背景亮度
     border = np.concatenate([
         gray[0, :],
         gray[-1, :],
@@ -67,74 +62,63 @@ def preprocess_image(image):
         gray[:, -1]
     ])
 
-    background_value = float(np.median(border))
+    background = float(np.median(border))
 
-    # 3. 提取笔画的灰度强度
-    if background_value >= 127:
-        ink = 255 - gray
+    # 3. 提取与背景不同的笔画
+    if background > 127:
+        contrast = 255 - gray
     else:
-        ink = gray.copy()
+        contrast = gray.copy()
 
-    # 4. Otsu 自动阈值，提取数字区域
-    _, mask = cv2.threshold(
-        ink,
+    # 4. Otsu 二值化
+    _, binary = cv2.threshold(
+        contrast,
         0,
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
-    # 5. 连接断开的细小笔画
-    kernel = np.ones((3, 3), np.uint8)
+    # 5. 连接相邻笔画
+    kernel = np.ones((2, 2), np.uint8)
 
-    mask = cv2.morphologyEx(
-        mask,
+    binary = cv2.morphologyEx(
+        binary,
         cv2.MORPH_CLOSE,
         kernel
     )
 
-    # 6. 删除很小的噪点
+    # 6. 删除小噪点
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask,
+        binary,
         connectivity=8
     )
 
-    clean_mask = np.zeros_like(mask)
+    clean = np.zeros_like(binary)
 
     min_area = max(3, int(h * w * 0.0002))
 
     for i in range(1, count):
-        area = stats[i, cv2.CC_STAT_AREA]
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            clean[labels == i] = 255
 
-        if area >= min_area:
-            clean_mask[labels == i] = 255
-
-    if np.count_nonzero(clean_mask) == 0:
-        clean_mask = mask.copy()
+    if np.count_nonzero(clean) == 0:
+        clean = binary.copy()
 
     # 7. 获取数字边界
-    points = cv2.findNonZero(clean_mask)
+    points = cv2.findNonZero(clean)
 
     if points is None:
-        raise ValueError("没有检测到数字，请换一张更清晰的图片。")
+        raise ValueError("没有检测到数字，请更换图片。")
 
     x, y, box_w, box_h = cv2.boundingRect(points)
 
-    # 裁剪数字区域
-    crop_mask = clean_mask[y:y + box_h, x:x + box_w]
-    crop_ink = ink[y:y + box_h, x:x + box_w]
+    crop = clean[y:y + box_h, x:x + box_w]
 
-    # 8. 保留灰度笔画，只去掉背景
-    crop = cv2.bitwise_and(
-        crop_ink,
-        crop_ink,
-        mask=crop_mask
-    )
+    # 8. 保持宽高比例，缩放到最大 7×7
+    scale = 7.0 / max(box_w, box_h)
 
-    # 9. 保持宽高比例，缩放到最大 20×20
-    scale = 20.0 / max(box_w, box_h)
-
-    new_w = max(1, int(round(box_w * scale)))
-    new_h = max(1, int(round(box_h * scale)))
+    new_w = max(1, min(7, int(round(box_w * scale))))
+    new_h = max(1, min(7, int(round(box_h * scale))))
 
     resized = cv2.resize(
         crop,
@@ -142,77 +126,46 @@ def preprocess_image(image):
         interpolation=cv2.INTER_AREA
     )
 
-    # 10. 放入 28×28 黑色画布中央
-    canvas = np.zeros((28, 28), dtype=np.uint8)
+    # 9. 放进 8×8 画布中央
+    small = np.zeros((8, 8), dtype=np.uint8)
 
-    start_x = (28 - new_w) // 2
-    start_y = (28 - new_h) // 2
+    start_x = (8 - new_w) // 2
+    start_y = (8 - new_h) // 2
 
-    canvas[
+    small[
         start_y:start_y + new_h,
         start_x:start_x + new_w
     ] = resized
 
-    # 11. 根据像素重心进行居中
-    moments = cv2.moments(canvas)
-
-    if moments["m00"] > 0:
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
-
-        shift_x = 13.5 - cx
-        shift_y = 13.5 - cy
-
-        matrix = np.float32([
-            [1, 0, shift_x],
-            [0, 1, shift_y]
-        ])
-
-        canvas = cv2.warpAffine(
-            canvas,
-            matrix,
-            (28, 28),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
-        )
-
-    # 12. 从 28×28 缩小到 8×8
-    small = cv2.resize(
-        canvas,
-        (8, 8),
-        interpolation=cv2.INTER_AREA
-    )
-
-    # 13. 映射到 0-16
-    max_value = float(small.max())
-
-    if max_value > 0:
-        processed = small.astype(np.float32) / max_value * 16.0
-    else:
-        processed = small.astype(np.float32)
-
+    # 10. 转换到 0-16
+    processed = small.astype(np.float32) / 255.0 * 16.0
     processed = np.clip(processed, 0, 16)
 
-    # 模型输入
     model_input = processed.reshape(1, 64)
 
-    # 14. 预览图片
+    # 11. 预览图
     crop_preview = Image.fromarray(crop)
-    binary_preview = Image.fromarray(clean_mask)
-    resized_preview = Image.fromarray(canvas)
+    binary_preview = Image.fromarray(clean)
+
+    # 最近邻放大，清楚显示像素结构
+    resized_preview = Image.fromarray(small).resize(
+        (280, 280),
+        Image.Resampling.NEAREST
+    )
 
     processed_preview = Image.fromarray(
         np.uint8(processed / 16.0 * 255.0)
+    ).resize(
+        (320, 320),
+        Image.Resampling.NEAREST
     )
 
-    debug_info = {
+    debug = {
         "原始图片尺寸": f"{w} × {h}",
-        "检测到的数字尺寸": f"{box_w} × {box_h}",
-        "28×28 非零像素数": int(np.count_nonzero(canvas)),
-        "28×28 最大像素值": int(canvas.max()),
-        "8×8 非零像素数": int(np.count_nonzero(processed)),
-        "8×8 最大像素值": float(processed.max())
+        "数字裁剪尺寸": f"{box_w} × {box_h}",
+        "缩放后尺寸": f"{new_w} × {new_h}",
+        "8×8 非零像素数": int(np.count_nonzero(small)),
+        "8×8 最大像素值": int(small.max())
     }
 
     return (
@@ -222,18 +175,17 @@ def preprocess_image(image):
         resized_preview,
         processed_preview,
         processed,
-        debug_info
+        debug
     )
 
 
-# ==========================================
-# 模型预测
-# ==========================================
+# ======================================
+# 预测
+# ======================================
 
 def predict_digit(model, model_input):
 
     prediction = model.predict(model_input)[0]
-
     confidence = None
 
     if hasattr(model, "predict_proba"):
@@ -243,9 +195,9 @@ def predict_digit(model, model_input):
     return prediction, confidence
 
 
-# ==========================================
+# ======================================
 # 上传图片
-# ==========================================
+# ======================================
 
 uploaded_file = st.file_uploader(
     "上传手写数字图片",
@@ -267,42 +219,27 @@ if uploaded_file is not None:
             resized_preview,
             processed_preview,
             processed,
-            debug_info
+            debug
         ) = preprocess_image(image)
-
-        # ======================================
-        # 预处理结果
-        # ======================================
 
         st.divider()
         st.subheader("图片预处理结果")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
 
         with col1:
             st.markdown("**Binary Image**")
-            st.image(binary_preview, width=220)
+            st.image(binary_preview, width=250)
+
+            st.markdown("**Detected Handwriting**")
+            st.image(crop_preview, width=250)
 
         with col2:
-            st.markdown("**Detected Handwriting**")
-            st.image(crop_preview, width=220)
+            st.markdown("**Resized Digit (8×8 放大预览)**")
+            st.image(resized_preview, width=280)
 
-        with col3:
-            st.markdown("**Resized Digit (28×28)**")
-            st.image(
-                resized_preview.resize((280, 280)),
-                width=280
-            )
-
-        st.markdown("**Processed 8×8 Image**")
-        st.image(
-            processed_preview.resize((320, 320)),
-            width=320
-        )
-
-        # ======================================
-        # 8×8 矩阵
-        # ======================================
+            st.markdown("**Processed 8×8 Image**")
+            st.image(processed_preview, width=320)
 
         st.subheader("8×8 Pixel Matrix")
 
@@ -311,17 +248,9 @@ if uploaded_file is not None:
             use_container_width=True
         )
 
-        # ======================================
-        # 调试信息
-        # ======================================
-
         with st.expander("预处理调试信息"):
-            for key, value in debug_info.items():
+            for key, value in debug.items():
                 st.write(f"**{key}：** {value}")
-
-        # ======================================
-        # 预测结果
-        # ======================================
 
         st.divider()
         st.subheader("识别结果")
@@ -332,43 +261,29 @@ if uploaded_file is not None:
             with col1:
                 st.markdown("### KNN")
 
-                try:
-                    prediction, confidence = predict_digit(
-                        knn_model,
-                        model_input
-                    )
+                prediction, confidence = predict_digit(
+                    knn_model,
+                    model_input
+                )
 
-                    st.metric("预测数字", str(prediction))
+                st.metric("预测数字", str(prediction))
 
-                    if confidence is not None:
-                        st.metric(
-                            "模型置信度",
-                            f"{confidence:.2f}%"
-                        )
-
-                except Exception as e:
-                    st.error(f"KNN 预测失败：{e}")
+                if confidence is not None:
+                    st.metric("模型置信度", f"{confidence:.2f}%")
 
         if svm_model is not None:
             with col2:
                 st.markdown("### SVM")
 
-                try:
-                    prediction, confidence = predict_digit(
-                        svm_model,
-                        model_input
-                    )
+                prediction, confidence = predict_digit(
+                    svm_model,
+                    model_input
+                )
 
-                    st.metric("预测数字", str(prediction))
+                st.metric("预测数字", str(prediction))
 
-                    if confidence is not None:
-                        st.metric(
-                            "模型置信度",
-                            f"{confidence:.2f}%"
-                        )
-
-                except Exception as e:
-                    st.error(f"SVM 预测失败：{e}")
+                if confidence is not None:
+                    st.metric("模型置信度", f"{confidence:.2f}%")
 
     except Exception as e:
         st.error(f"图片处理失败：{e}")
@@ -377,21 +292,16 @@ else:
     st.info("请先上传一张手写数字图片。")
 
 
-# ==========================================
+# ======================================
 # 模型评估信息
-# ==========================================
+# ======================================
 
 metrics_path = BASE_DIR / "metrics.json"
 
 if metrics_path.exists():
-
     with st.expander("模型训练评估信息"):
-
         try:
             with open(metrics_path, "r", encoding="utf-8") as f:
-                metrics = json.load(f)
-
-            st.json(metrics)
-
+                st.json(json.load(f))
         except Exception as e:
-            st.warning(f"无法读取 metrics.json：{e}")
+            st.warning(f"无法读取评估信息：{e}")
