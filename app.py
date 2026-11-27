@@ -74,7 +74,9 @@ def make_pixel_grid(matrix):
 
             value = int(matrix[row, col])
 
-            brightness = int(value / 16 * 255)
+            brightness = int(
+                np.clip(value, 0, 16) / 16 * 255
+            )
 
             x1 = margin + col * cell_size
             y1 = margin + row * cell_size
@@ -84,7 +86,11 @@ def make_pixel_grid(matrix):
 
             draw.rectangle(
                 [x1, y1, x2, y2],
-                fill=(brightness, brightness, brightness),
+                fill=(
+                    brightness,
+                    brightness,
+                    brightness
+                ),
                 outline=(100, 100, 100)
             )
 
@@ -124,21 +130,20 @@ def preprocess_image(image):
         0
     )
 
-    # 4. 根据背景颜色选择正确的二值化方向
+    # 4. 根据背景颜色选择二值化方向
     if background_value >= 127:
 
-        # 浅色背景，深色笔画
+        # 浅色背景、深色笔画
         threshold_type = cv2.THRESH_BINARY_INV
         threshold_c = 8
 
     else:
 
-        # 深色背景，浅色笔画
+        # 深色背景、浅色笔画
         threshold_type = cv2.THRESH_BINARY
         threshold_c = -8
 
     # 5. 自适应阈值
-    # 这一步不再使用之前容易误判背景的全局 Otsu 阈值
     min_dimension = min(height, width)
 
     block_size = min(51, min_dimension)
@@ -212,7 +217,7 @@ def preprocess_image(image):
             "没有找到位于图片内部的有效笔画。"
         )
 
-    # 9. 找最大主体区域
+    # 9. 找到最大主体区域
     largest = max(
         candidates,
         key=lambda item: item["area"]
@@ -226,7 +231,6 @@ def preprocess_image(image):
     lh = largest["h"]
 
     # 10. 只保留主体附近的有效笔画
-    # 避免把远处的背景噪声也放进数字
     nearby_padding = max(
         15,
         int(max(lw, lh) * 0.25)
@@ -259,7 +263,6 @@ def preprocess_image(image):
 
         area = item["area"]
 
-        # 面积太小的组件不保留
         if area < min_component_area:
             continue
 
@@ -278,6 +281,7 @@ def preprocess_image(image):
             kept_components += 1
 
     if np.count_nonzero(clean) == 0:
+
         raise ValueError(
             "没有找到有效的数字笔画。"
         )
@@ -287,7 +291,7 @@ def preprocess_image(image):
 
     x, y, box_width, box_height = cv2.boundingRect(points)
 
-    # 如果边界仍然接近整张照片，不继续生成错误预测
+    # 如果边界仍然接近整张照片，停止错误预测
     if (
         box_width > width * 0.85 or
         box_height > height * 0.85
@@ -297,7 +301,7 @@ def preprocess_image(image):
             "背景仍被识别为数字。请使用背景更均匀、数字更清晰的图片。"
         )
 
-    # 12. 裁剪数字，添加少量黑色边缘
+    # 12. 裁剪数字，添加少量边缘
     padding = max(
         3,
         int(max(box_width, box_height) * 0.08)
@@ -372,8 +376,7 @@ def preprocess_image(image):
         interpolation=cv2.INTER_AREA
     )
 
-    # 16. 转换成 0–16
-    # 不再使用最大值归一化，保留真实的灰度比例
+    # 16. 转换成 0–16，作为模型实际输入
     processed = (
         small.astype(np.float32) / 255.0 * 16.0
     )
@@ -384,32 +387,49 @@ def preprocess_image(image):
         16
     ).astype(np.float32)
 
-    # 17. 检查有效像素
-    nonzero_pixels = int(
-        np.count_nonzero(processed)
-    )
-
-    if nonzero_pixels < 5:
-
-        raise ValueError(
-            "转换后的 8×8 像素太少，数字细节已经丢失。"
-        )
-
-    # 18. 模型输入
+    # 模型输入：保持原始预处理数值
     model_input = processed.reshape(1, 64)
 
-    # 19. 预览图片
+    # ==================================
+    # 17. 单独增强预览图对比度
+    # 不改变 model_input 和 processed
+    # ==================================
+
+    display_matrix = processed.copy()
+
+    display_max = float(display_matrix.max())
+
+    if display_max > 0:
+
+        display_matrix = (
+            display_matrix / display_max * 16.0
+        )
+
+    display_matrix = np.clip(
+        display_matrix,
+        0,
+        16
+    )
+
+    # ==================================
+    # 18. 生成预览图片
+    # ==================================
+
     binary_preview = Image.fromarray(binary)
 
     crop_preview = Image.fromarray(crop)
 
+    # 28×28 预览
     resized_preview = Image.fromarray(canvas28).resize(
         (280, 280),
         Image.Resampling.NEAREST
     )
 
+    # 增强对比度后的 8×8 图片
     processed_display = np.uint8(
-        processed / 16.0 * 255.0
+        np.round(
+            display_matrix / 16.0 * 255.0
+        )
     )
 
     processed_preview = Image.fromarray(
@@ -419,11 +439,15 @@ def preprocess_image(image):
         Image.Resampling.NEAREST
     )
 
+    # 增强对比度后的像素网格
     grid_preview = make_pixel_grid(
-        processed.astype(int)
+        np.rint(display_matrix).astype(int)
     )
 
-    # 20. 调试信息
+    # ==================================
+    # 19. 调试数据
+    # ==================================
+
     debug = {
         "原始图片尺寸": f"{width} × {height}",
         "背景亮度": round(background_value, 2),
@@ -436,8 +460,9 @@ def preprocess_image(image):
         "实际裁剪尺寸": f"{crop_width} × {crop_height}",
         "缩放后尺寸": f"{new_width} × {new_height}",
         "28×28 非零像素数": int(np.count_nonzero(canvas28)),
-        "8×8 非零像素格数": nonzero_pixels,
-        "8×8 最大像素值": round(float(processed.max()), 2)
+        "8×8 非零像素格数": int(np.count_nonzero(processed)),
+        "8×8 最大像素值": round(float(processed.max()), 2),
+        "预览增强后最大像素值": round(float(display_matrix.max()), 2)
     }
 
     return (
@@ -539,14 +564,14 @@ if uploaded_file is not None:
             width=280
         )
 
-        st.markdown("### Processed 8×8 Image")
+        st.markdown("### Processed 8×8 Image（增强预览）")
 
         st.image(
             processed_preview,
             width=400
         )
 
-        st.markdown("### 8×8 Pixel Grid")
+        st.markdown("### 8×8 Pixel Grid（增强预览）")
 
         st.image(
             grid_preview,
